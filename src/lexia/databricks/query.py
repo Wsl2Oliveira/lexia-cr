@@ -34,8 +34,8 @@ SELECT
     ext.official_letter_extraction__start_date               AS data_inicio,
     ext.official_letter_extraction__end_date                 AS data_fim,
 
-    inv.investigated_information__name            AS nome_investigado,
-    inv.investigated_information__cpf_cnpj        AS cpf_cnpj,
+    name_pii.investigated_information__name       AS nome_investigado,
+    cpf_pii.investigated_information__cpf_cnpj    AS cpf_cnpj,
     inv.investigated_information__requested_value AS valor_solicitado,
     inv.investigated_information__customer_id     AS customer_id,
     inv.investigated_information__is_customer     AS is_cliente_nu
@@ -48,8 +48,14 @@ INNER JOIN etl.br__dataset.jud_athena_submissions sub
 INNER JOIN etl.br__dataset.jud_athena_official_letters ol
     ON ol.official_letter__submission_id = sub.submission__id
 
-LEFT JOIN etl.br__dataset.jud_athena_investigated_information inv
+LEFT JOIN etl.br__contract.jud_athena__investigated_information inv
     ON inv.investigated_information__id = ol.investigated_information__id[0]
+
+LEFT JOIN etl.br__contract.jud_athena__investigated_information_name_pii name_pii
+    ON name_pii.hash = inv.investigated_information__name
+
+LEFT JOIN etl.br__contract.jud_athena__investigated_information_cpf_cnpj_pii cpf_pii
+    ON cpf_pii.hash = inv.investigated_information__cpf_cnpj
 
 WHERE ol.official_letter__type IN (
         'official_letter_type__block',
