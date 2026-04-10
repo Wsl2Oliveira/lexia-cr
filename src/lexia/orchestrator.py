@@ -60,23 +60,47 @@ async def enrich_case(case: JudicialCase) -> dict:
     }
 
 
+def _format_document(raw: str | None) -> str:
+    """Format CPF (000.000.000-00) or CNPJ (00.000.000/0000-00)."""
+    digits = (raw or "").replace(".", "").replace("-", "").replace("/", "").replace(" ", "")
+    if len(digits) == 11:
+        return f"{digits[:3]}.{digits[3:6]}.{digits[6:9]}-{digits[9:]}"
+    if len(digits) == 14:
+        return f"{digits[:2]}.{digits[2:5]}.{digits[5:8]}/{digits[8:12]}-{digits[12:]}"
+    return raw or ""
+
+
+def _detect_doc_type(raw: str | None) -> str:
+    """Return 'CPF' if 11 digits, 'CNPJ' otherwise."""
+    digits = (raw or "").replace(".", "").replace("-", "").replace("/", "").replace(" ", "")
+    return "CPF" if len(digits) <= 11 else "CNPJ"
+
+
 def _build_replacements(case: JudicialCase, decision) -> dict[str, str]:
-    """Map case fields + Gemini decision to Google Docs template placeholders."""
+    """Map case fields + Gemini decision to Google Docs template placeholders.
+
+    Keys match the EXACT text in the Google Docs template.
+    Bracketed keys (e.g. "número do ofício") are wrapped in {{}} in the doc.
+    Plain-text keys (e.g. "CPF (CNPJ)") appear as literal text.
+    """
+    import locale
+    from datetime import date
+
+    try:
+        locale.setlocale(locale.LC_TIME, "pt_BR.UTF-8")
+    except locale.Error:
+        pass
+
     return {
-        "NUMERO_OFICIO": case.numero_oficio or "",
-        "NUMERO_PROCESSO": case.numero_processo or "",
-        "NOME_INVESTIGADO": case.nome_investigado or "",
-        "CPF_CNPJ": case.cpf_cnpj or "",
-        "TIPO_OFICIO": case.tipo_oficio or "",
-        "VARA_TRIBUNAL": case.vara_tribunal or "",
-        "ORGAO_NOME": case.orgao_nome or "",
-        "ORGAO_ENDERECO": case.orgao_endereco or "",
-        "VALOR_SOLICITADO": case.valor_solicitado or "",
-        "VALOR_BLOQUEIO": decision.valor_bloqueio or "",
-        "MACRO_APLICADA": decision.macro_aplicada or "",
-        "TEXTO_RESPOSTA": decision.texto_resposta or "",
-        "DATA_RESPOSTA": "",  # filled at generation time
-        "OBSERVACOES": decision.observacoes or "",
+        "número do ofício": case.numero_oficio or "",
+        "número do processo": case.numero_processo or "",
+        "NOME DO CLIENTE ATINGIDO": case.nome_investigado or "",
+        "documento do cliente atingido": _format_document(case.cpf_cnpj),
+        "Vara/Seccional": case.vara_tribunal or "",
+        "Órgão (delegacia/tribunal)": case.orgao_nome or "",
+        "macro da operação realizada": decision.texto_resposta or "",
+        "data da elaboração deste documento": date.today().strftime("%d de %B de %Y"),
+        "CPF (CNPJ)": _detect_doc_type(case.cpf_cnpj),
     }
 
 
@@ -102,8 +126,6 @@ async def process_single_case(case: JudicialCase) -> dict:
         )
 
         replacements = _build_replacements(case, decision)
-        from datetime import date
-        replacements["DATA_RESPOSTA"] = date.today().strftime("%d/%m/%Y")
 
         doc_name = f"CR-{case.numero_oficio or case.id[:8]}-{case.tipo_oficio}"
         letter = generate_letter(doc_name, replacements, export_as_pdf=True)

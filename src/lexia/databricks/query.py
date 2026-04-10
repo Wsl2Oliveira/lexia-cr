@@ -14,8 +14,8 @@ QUERY_CASES = """
 SELECT
     ol.official_letter__id                          AS id,
     ol.official_letter__type                        AS tipo_oficio,
-    ol.official_letter__official_letter_number       AS numero_oficio,
-    ol.official_letter__lawsuit_number               AS numero_processo,
+    ext.official_letter_extraction__craft_document_number    AS numero_oficio,
+    ext.official_letter_extraction__process_document_number  AS numero_processo,
     ol.official_letter__status                       AS status_oficio,
     ol.official_letter__origin                       AS origem,
     ol.official_letter__deadline_date                AS prazo,
@@ -26,7 +26,7 @@ SELECT
     ext.official_letter_extraction__organ_name               AS orgao_nome,
     ext.official_letter_extraction__organ_address            AS orgao_endereco,
     ext.official_letter_extraction__response_email           AS email_resposta,
-    ext.official_letter_extraction__document_receipt_date    AS data_recebimento,
+    ext.official_letter_extraction__created_at               AS data_recebimento,
     ext.official_letter_extraction__is_reiteration           AS is_reiteracao,
     ext.official_letter_extraction__office_text_observations AS observacoes,
     ext.official_letter_extraction__zendesk_ticket_number    AS ticket_zendesk,
@@ -40,20 +40,24 @@ SELECT
     inv.investigated_information__customer_id     AS customer_id,
     inv.investigated_information__is_customer     AS is_cliente_nu
 
-FROM etl.br__dataset.jud_athena_official_letters ol
-
-INNER JOIN etl.br__dataset.jud_athena_official_letter_extractions ext
-    ON ol.official_letter__id = ext.official_letter_extraction__official_letter_id
+FROM etl.br__dataset.jud_athena_official_letter_extractions ext
 
 INNER JOIN etl.br__dataset.jud_athena_submissions sub
+    ON ext.official_letter_extraction__submission_id = sub.submission__id
+
+INNER JOIN etl.br__dataset.jud_athena_official_letters ol
     ON ol.official_letter__submission_id = sub.submission__id
 
 LEFT JOIN etl.br__dataset.jud_athena_investigated_information inv
     ON inv.investigated_information__id = ol.investigated_information__id[0]
 
-WHERE ol.official_letter__type IN ('Bloqueio', 'Desbloqueio', 'Transferencia')
-  AND ext.official_letter_extraction__document_receipt_date >= current_date() - INTERVAL {days_back} DAYS
-  AND ext.official_letter_extraction__status = 'confirmed'
+WHERE ol.official_letter__type IN (
+        'official_letter_type__block',
+        'official_letter_type__dismiss',
+        'official_letter_type__transfer'
+    )
+  AND ext.official_letter_extraction__status = 'official_letter_extraction_status__confirmed'
+  AND ext.official_letter_extraction__created_at >= current_date() - INTERVAL {days_back} DAYS
 """
 
 

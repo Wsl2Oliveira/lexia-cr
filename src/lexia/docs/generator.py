@@ -55,18 +55,31 @@ def copy_template(doc_name: str) -> str:
     return doc_id
 
 
+_PLAIN_TEXT_KEYS = {"data da elaboração deste documento", "CPF (CNPJ)"}
+
+
 def fill_placeholders(doc_id: str, replacements: dict[str, str]) -> None:
-    """Replace all {{PLACEHOLDER}} markers in the document with actual values."""
+    """Replace placeholders in the document with actual values.
+
+    Handles two formats:
+      - {{key}} — standard bracketed placeholders
+      - plain text — literal text in the doc (e.g. "CPF (CNPJ)")
+    """
     docs = _get_docs()
-    requests = [
-        {
+    requests = []
+
+    for key, value in replacements.items():
+        if key in _PLAIN_TEXT_KEYS:
+            search_text = key
+        else:
+            search_text = f"{{{{{key}}}}}"
+
+        requests.append({
             "replaceAllText": {
-                "containsText": {"text": f"{{{{{key}}}}}", "matchCase": True},
+                "containsText": {"text": search_text, "matchCase": False},
                 "replaceText": value or "",
             }
-        }
-        for key, value in replacements.items()
-    ]
+        })
 
     if not requests:
         return
