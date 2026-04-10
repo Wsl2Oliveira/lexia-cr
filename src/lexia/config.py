@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     # Databricks
     databricks_host: str = "https://nubank-e2-general.cloud.databricks.com"
     databricks_token: str = ""
+    databricks_http_path: str = "/sql/1.0/warehouses/auto"
 
     # Nubank API auth
     nu_cert_path: str = ""

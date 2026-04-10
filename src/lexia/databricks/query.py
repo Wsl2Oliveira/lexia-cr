@@ -96,7 +96,7 @@ def fetch_pending_cases(days_back: int | None = None) -> list[JudicialCase]:
 
     with dbsql.connect(
         server_hostname=settings.databricks_host.replace("https://", ""),
-        http_path="/sql/1.0/warehouses/auto",
+        http_path=settings.databricks_http_path,
         access_token=settings.databricks_token,
     ) as conn:
         with conn.cursor() as cursor:
