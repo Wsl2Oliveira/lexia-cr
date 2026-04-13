@@ -16,9 +16,9 @@ dependencies = [
     "rich>=13.9",
     "typer>=0.12",
     "databricks-sql-connector>=3.0",
-    "google-auth>=2.35",
-    "google-api-python-client>=2.150",
-    "google-generativeai>=0.8",
+    "openai>=1.50",
+    "gspread>=6.0",
+    "google-auth>=2.29",
 ]
 
 [project.optional-dependencies]

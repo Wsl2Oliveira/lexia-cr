@@ -1,0 +1,92 @@
+{
+  "channel_id": "C06L1G99R9C",
+  "bot_user_id": "U02NX0ZFLBS",
+  "deadline_unix": 1739059200,
+  "note": "Alpha posts are RPA batch logs ([RPA - Initial Separation - DD/MM/YYYY]). Judicial 'case' signals are usually :warning: lines: 'Ofício ID …, tipo Bloqueio|Desbloqueio|… não encontrado…'. CNJ process numbers, macro IDs, APIs, Drive links, and Carta-Resposta template steps are not present in these bot messages; execution detail is typically in attached Relatorio_Execucao_*.docx files (Slack file IDs in thread).",
+  "grouping_rules": "BLOQUEIO = thread sampled as Bloqueio-heavy and no Desbloqueio in prior reads. DESBLOQUEIO = Desbloqueio present and no Bloqueio in prior reads. OTHER_UNCLEAR = mixed Bloqueio+Desbloqueio, outros/transferência/SID-only, partial pagination, or no judicial tipo in retrieved lines.",
+  "buckets": {
+    "BLOQUEIO": [
+      {
+        "thread_ts": "1738753308.306849",
+        "rationale": "Multiple tipo Bloqueio warnings in sampled messages (session transcript)."
+      },
+      {
+        "thread_ts": "1737543885.300239",
+        "rationale": "Multiple tipo Bloqueio warnings in sampled pages."
+      },
+      {
+        "thread_ts": "1738580469.578999",
+        "rationale": "Multiple tipo Bloqueio warnings."
+      }
+    ],
+    "DESBLOQUEIO": [
+      {
+        "thread_ts": "1732705339.342819",
+        "rationale": "Search/thread sampling showed Desbloqueio warnings without paired Bloqueio in those pulls."
+      }
+    ],
+    "OTHER_UNCLEAR": [
+      {
+        "thread_ts": "1731582331.447879",
+        "rationale": "Mixed Bloqueio and Desbloqueio warnings in same thread."
+      },
+      {
+        "thread_ts": "1738839678.258839",
+        "rationale": "Mixed Bloqueio and Desbloqueio warnings."
+      },
+      {
+        "thread_ts": "1730113386.445429",
+        "rationale": "Mixed Bloqueio and Desbloqueio warnings."
+      },
+      {
+        "thread_ts": "1730804971.681379",
+        "rationale": "Very large thread; only partial pages captured in session—tipo mix not fully enumerated."
+      },
+      {
+        "thread_ts": "1738580708.287859",
+        "rationale": "Heavy 'Outros' plus Bloqueio; operational mix."
+      },
+      {
+        "thread_ts": "1738148694.141389",
+        "rationale": "Mixed Bloqueio and Desbloqueio in sampled pages."
+      },
+      {
+        "thread_ts": "1733484591.152329",
+        "rationale": "Only '*Processo Iniciado*' child seen; no Bloqueio/Desbloqueio text in retrieved lines."
+      },
+      {
+        "thread_ts": "1733138063.000659",
+        "rationale": "Same long thread contains both tipo Bloqueio and tipo Desbloqueio warnings (paginated reads).",
+        "example_bloqueio_oficio_ids": [
+          "21 1808",
+          "211780",
+          "211767",
+          "211765",
+          "21 1908",
+          "211898",
+          "211808"
+        ],
+        "example_desbloqueio_oficio_ids": ["211914"]
+      },
+      {
+        "thread_ts": "1732792042.618949",
+        "rationale": "Contains both Bloqueio and Desbloqueio warnings in merged pages.",
+        "example_bloqueio_oficio_ids": ["11329"],
+        "example_desbloqueio_oficio_ids": ["21 1027"]
+      },
+      {
+        "thread_ts": "1732707003.600839",
+        "rationale": "Contains Bloqueio and multiple Desbloqueio warnings in head segment.",
+        "example_bloqueio_oficio_ids": ["21 1005"],
+        "example_desbloqueio_oficio_ids": ["211053", "211039", "211027"]
+      }
+    ]
+  },
+  "fields_not_in_slack_bot_text": {
+    "processo_cnj": "Not emitted in these Alpha lines.",
+    "macro_name_id": "Not present in sampled messages.",
+    "api_endpoints": "Not present in sampled messages.",
+    "drive_links": "Not present; only Slack-hosted Relatorio_Execucao_*.docx attachments.",
+    "carta_resposta_generation": "Not described in bot thread text."
+  }
+}

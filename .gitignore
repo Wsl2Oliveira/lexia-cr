@@ -14,3 +14,10 @@ google-credentials.json
 .ruff_cache/
 .pytest_cache/
 .mypy_cache/
+.cursor/
+
+# PII / dados reais de clientes
+data/examples/
+data/generated_examples.json
+data/learning_base.json
+.drive_export/

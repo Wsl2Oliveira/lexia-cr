@@ -9,7 +9,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=Path(__file__).resolve().parents[3] / ".env",
+        env_file=Path(__file__).resolve().parents[2] / ".env",
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -24,14 +24,16 @@ class Settings(BaseSettings):
     nu_cert_key_path: str = ""
     nu_auth_url: str = "https://prod-global-auth.nubank.com.br/api/token"
 
-    # Google
-    google_credentials_path: str = "~/.config/lexia/google-credentials.json"
+    # Google (Apps Script Web App)
+    apps_script_url: str = ""
     google_template_doc_id: str = ""
     google_drive_folder_id: str = ""
+    google_service_account_path: str = ""
 
-    # Gemini
-    gemini_api_key: str = ""
-    gemini_model: str = "gemini-2.0-flash"
+    # LLM (via LiteLLM proxy)
+    litellm_api_key: str = ""
+    litellm_base_url: str = "https://br-prod-litellm.nullmplatform.com/v1"
+    litellm_model: str = "gemini/gemini-2.0-flash"
 
     # Processing
     days_back: int = Field(default=12, description="Days back to query cases")

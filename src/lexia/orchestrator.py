@@ -128,7 +128,7 @@ async def process_single_case(case: JudicialCase) -> dict:
         replacements = _build_replacements(case, decision)
 
         doc_name = f"CR-{case.numero_oficio or case.id[:8]}-{case.tipo_oficio}"
-        letter = generate_letter(doc_name, replacements, export_as_pdf=True)
+        letter = await generate_letter(doc_name, replacements)
 
         result = {
             "case_id": case.id,

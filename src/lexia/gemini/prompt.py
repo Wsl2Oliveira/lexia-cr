@@ -1,11 +1,11 @@
-"""Gemini integration — send case data with LexIA prompt, receive macro decision."""
+"""LLM integration via LiteLLM — send case data with LexIA prompt, receive macro decision."""
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
 
-import google.generativeai as genai
 import structlog
+from openai import OpenAI
 
 from lexia.config import settings
 
@@ -55,7 +55,7 @@ def _build_case_context(
     assets: list[dict],
     blocks: list[dict],
 ) -> str:
-    """Build the context string that goes into the Gemini prompt."""
+    """Build the context string that goes into the prompt."""
     return json.dumps(
         {
             "dados_caso": case_data,
@@ -68,6 +68,13 @@ def _build_case_context(
     )
 
 
+def _get_client() -> OpenAI:
+    return OpenAI(
+        api_key=settings.litellm_api_key,
+        base_url=settings.litellm_base_url,
+    )
+
+
 async def decide_macro(
     case_data: dict,
     cards: list[dict],
@@ -75,7 +82,7 @@ async def decide_macro(
     blocks: list[dict],
     prompt_override: str | None = None,
 ) -> LexiaDecision:
-    """Send case data to Gemini and get the macro decision.
+    """Send case data to LLM and get the macro decision.
 
     Args:
         case_data: Dict with judicial case fields.
@@ -87,31 +94,35 @@ async def decide_macro(
     Returns:
         LexiaDecision with the macro and response text.
     """
-    genai.configure(api_key=settings.gemini_api_key)
-    model = genai.GenerativeModel(
-        model_name=settings.gemini_model,
-        system_instruction=prompt_override or LEXIA_SYSTEM_PROMPT,
-    )
-
+    client = _get_client()
     context = _build_case_context(case_data, cards, assets, blocks)
     user_message = f"Analise o caso abaixo e decida a macro:\n\n{context}"
 
-    log.info("gemini_request", case_id=case_data.get("id", "?")[:8], model=settings.gemini_model)
+    log.info("llm_request", case_id=case_data.get("id", "?")[:8], model=settings.litellm_model)
 
-    response = model.generate_content(user_message)
-    raw = response.text.strip()
+    response = client.chat.completions.create(
+        model=settings.litellm_model,
+        messages=[
+            {"role": "system", "content": prompt_override or LEXIA_SYSTEM_PROMPT},
+            {"role": "user", "content": user_message},
+        ],
+        temperature=0.2,
+        max_tokens=4096,
+    )
+
+    raw = response.choices[0].message.content.strip()
 
     try:
         cleaned = raw.removeprefix("```json").removesuffix("```").strip()
         parsed = json.loads(cleaned)
     except (json.JSONDecodeError, ValueError):
-        log.warning("gemini_parse_failed", raw=raw[:200])
+        log.warning("llm_parse_failed", raw=raw[:200])
         return LexiaDecision(
             macro_aplicada="ERRO_PARSE",
             id_macro="0",
             valor_bloqueio=None,
             texto_resposta=raw,
-            observacoes="Falha ao parsear resposta do Gemini",
+            observacoes="Falha ao parsear resposta do LLM",
             raw_response=raw,
         )
 
@@ -125,7 +136,7 @@ async def decide_macro(
     )
 
     log.info(
-        "gemini_decision",
+        "llm_decision",
         case_id=case_data.get("id", "?")[:8],
         macro=decision.id_macro,
         macro_name=decision.macro_aplicada,
