@@ -19,6 +19,7 @@ dependencies = [
     "openai>=1.50",
     "gspread>=6.0",
     "google-auth>=2.29",
+    "slack-sdk>=3.27",
 ]
 
 [project.optional-dependencies]

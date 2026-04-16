@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     )
 
     # Databricks
-    databricks_host: str = "https://nubank-e2-general.cloud.databricks.com"
+    databricks_host: str = ""
     databricks_token: str = ""
     databricks_http_path: str = "/sql/1.0/warehouses/auto"
 
@@ -32,8 +32,13 @@ class Settings(BaseSettings):
 
     # LLM (via LiteLLM proxy)
     litellm_api_key: str = ""
-    litellm_base_url: str = "https://br-prod-litellm.nullmplatform.com/v1"
+    litellm_base_url: str = ""
     litellm_model: str = "gemini/gemini-2.0-flash"
+
+    # Slack Bot
+    slack_bot_token: str = ""
+    slack_channel_id: str = ""
+    slack_notify_enabled: bool = True
 
     # Processing
     days_back: int = Field(default=12, description="Days back to query cases")
