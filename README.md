@@ -269,7 +269,7 @@ lexia-cr/
 | Aspecto | Antes (UiPath) | Agora (LexIA) |
 |---------|----------------|---------------|
 | Dependência | UiPath + licença + banco Oracle JD | Python + Databricks direto |
-| Consulta do cliente | Limitada (saldo NuConta) | Completa (8 APIs: NuConta + Caixinhas + cartões + bloqueios + dados bancários) |
+| Consulta do cliente | 5 APIs (Waze, Customers, Crebito, Rayquaza, Petrificus) | 8 APIs (+Diablo, Facade, savings-accounts, Mario-Box, bank-accounts-widget-provider) |
 | Decisão da resposta | Analista escolhe manualmente | IA escolhe com base em regras + dados |
 | Geração da carta | Analista redige | IA gera o texto, doc formatado automaticamente |
 | Rastreabilidade | Bot Thunder | Planilha com 23+ campos por caso + Slack |

@@ -1099,9 +1099,13 @@ def write_to_sheets(rows: list[list[str]]) -> str | None:
     ws = sh.worksheet(SHEET_NAME)
 
     existing = ws.get_all_values()
-    if not existing:
+    current_header = existing[0] if existing else []
+
+    if current_header != HEADER_ROW:
         ws.update(range_name="A1", values=[HEADER_ROW])
-        ws.format("A1:AB1", {"textFormat": {"bold": True}})
+        last_col = chr(ord("A") + len(HEADER_ROW) - 1)
+        ws.format(f"A1:{last_col}1", {"textFormat": {"bold": True}})
+        print(f"  ✓ Header {'corrigido' if current_header else 'criado'} na linha 1")
 
     ws.append_rows(rows, value_input_option="RAW")
 
