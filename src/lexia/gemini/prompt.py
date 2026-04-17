@@ -1,4 +1,5 @@
 """LLM integration via LiteLLM — send case data with LexIA prompt, receive macro decision."""
+
 from __future__ import annotations
 
 import json

@@ -5,6 +5,7 @@ Usage:
 
 Requires APPS_SCRIPT_URL in .env (deploy the Apps Script first).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -120,10 +121,11 @@ async def generate_example(example: dict) -> dict:
         "replacements": example["replacements"],
     }
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Gerando: {example['doc_name']}")
     print(f"  Tipo: {example['tipo']} / {example['subtipo']}")
-    print(f"  Template: {'único atingido' if example['template_id'] == TEMPLATE_UNICO else 'múltiplos atingidos'}")
+    tpl = "único atingido" if example["template_id"] == TEMPLATE_UNICO else "múltiplos atingidos"
+    print(f"  Template: {tpl}")
 
     result = await call_apps_script(payload)
 
@@ -135,7 +137,10 @@ async def generate_example(example: dict) -> dict:
 async def main():
     print("=" * 60)
     print("LexIA CR — Gerador de Cartas-Exemplo via Apps Script")
-    print(f"Apps Script URL: {settings.apps_script_url[:50]}..." if settings.apps_script_url else "Apps Script URL: NÃO CONFIGURADA")
+    if settings.apps_script_url:
+        print(f"Apps Script URL: {settings.apps_script_url[:50]}...")
+    else:
+        print("Apps Script URL: NÃO CONFIGURADA")
     print(f"Pasta destino: {TARGET_FOLDER}")
     print(f"Total de exemplos: {len(EXAMPLES)}")
     print("=" * 60)
@@ -154,7 +159,7 @@ async def main():
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(results, indent=2, ensure_ascii=False))
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"✓ {len(results)} cartas geradas com sucesso!")
     print(f"  Resultados salvos em: {output_path}")
     print(f"  Pasta Drive: https://drive.google.com/drive/folders/{TARGET_FOLDER}")

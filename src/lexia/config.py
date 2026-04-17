@@ -1,4 +1,5 @@
 """Centralized configuration loaded from environment / .env file."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -41,8 +42,16 @@ class Settings(BaseSettings):
     slack_notify_enabled: bool = True
 
     # Processing
-    days_back: int = Field(default=12, description="Days back to query cases")
+    days_back: int = Field(default=3, description="Days back to query cases")
     log_level: str = "INFO"
+
+    # Pipeline
+    spreadsheet_id: str = Field(default="", alias="LEXIA_SPREADSHEET_ID")
+    target_processes: str = Field(
+        default="",
+        alias="LEXIA_TARGET_PROCESSES",
+        description="Comma-separated process numbers",
+    )
 
 
 settings = Settings()

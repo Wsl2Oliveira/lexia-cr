@@ -1,4 +1,5 @@
 """Google Docs/Drive — call Apps Script to copy template and fill placeholders."""
+
 from __future__ import annotations
 
 import httpx
@@ -22,8 +23,7 @@ async def generate_letter(
     """
     if not settings.apps_script_url:
         raise RuntimeError(
-            "APPS_SCRIPT_URL not configured. "
-            "Deploy the Apps Script and set the URL in .env"
+            "APPS_SCRIPT_URL not configured. Deploy the Apps Script and set the URL in .env"
         )
 
     payload = {

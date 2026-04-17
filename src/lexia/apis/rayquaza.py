@@ -1,4 +1,5 @@
 """Find Available Assets — Rayquaza API."""
+
 from __future__ import annotations
 
 import structlog
@@ -14,8 +15,7 @@ async def find_available_assets(customer_id: str, shard: str) -> list[dict]:
     Returns a list of asset dicts with type, amount, currency, etc.
     """
     url = (
-        f"https://prod-{shard}-rayquaza.nubank.com.br"
-        f"/api/customers/{customer_id}/available-assets"
+        f"https://prod-{shard}-rayquaza.nubank.com.br/api/customers/{customer_id}/available-assets"
     )
     token = await get_uber_token()
 

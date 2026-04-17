@@ -1,4 +1,5 @@
 """CLI entry point for LexIA."""
+
 from __future__ import annotations
 
 import asyncio
@@ -69,10 +70,10 @@ def check():
         "Databricks Host": bool(settings.databricks_host),
         "Databricks Token": bool(settings.databricks_token),
         "Nu Cert Path": bool(settings.nu_cert_path),
-        "Google Credentials": bool(settings.google_credentials_path),
+        "Google Credentials": bool(settings.google_service_account_path),
         "Google Template ID": bool(settings.google_template_doc_id),
         "Google Drive Folder": bool(settings.google_drive_folder_id),
-        "Gemini API Key": bool(settings.gemini_api_key),
+        "Gemini API Key": bool(settings.litellm_api_key),
     }
 
     for name, ok in checks.items():

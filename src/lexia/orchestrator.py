@@ -1,7 +1,13 @@
-"""Main orchestrator — ties all modules together into a single pipeline."""
+"""Deprecated orchestrator — ties all modules together into a single pipeline.
+
+This module is deprecated. Prefer ``scripts/run_traced_pipeline.py``, which provides
+full traceability, Slack notifications, and Sheets logging.
+"""
+
 from __future__ import annotations
 
 import asyncio
+import warnings
 from dataclasses import asdict
 
 import structlog
@@ -113,7 +119,8 @@ async def process_single_case(case: JudicialCase) -> dict:
 
     Returns a result dict with status, doc_url, etc.
     """
-    log.info("processing_case", case_id=case.id, tipo=case.tipo_oficio, cpf=case.cpf_cnpj[:3] + "***" if case.cpf_cnpj else "N/A")
+    cpf_masked = case.cpf_cnpj[:3] + "***" if case.cpf_cnpj else "N/A"
+    log.info("processing_case", case_id=case.id, tipo=case.tipo_oficio, cpf=cpf_masked)
 
     try:
         enriched = await enrich_case(case)
@@ -148,6 +155,9 @@ async def process_single_case(case: JudicialCase) -> dict:
 async def run_pipeline(days_back: int | None = None, dry_run: bool = False) -> list[dict]:
     """Run the full LexIA pipeline.
 
+    .. deprecated::
+        Use ``scripts/run_traced_pipeline.py`` instead.
+
     1. Fetch pending cases from Databricks
     2. Process each case sequentially
     3. Return list of results
@@ -156,11 +166,20 @@ async def run_pipeline(days_back: int | None = None, dry_run: bool = False) -> l
         days_back: Override default days lookback.
         dry_run: If True, fetch cases but don't process.
     """
+    warnings.warn(
+        "run_pipeline() is deprecated. Use scripts/run_traced_pipeline.py instead, "
+        "which includes full traceability, Slack notifications, and Sheets logging.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     cases = fetch_pending_cases(days_back)
     log.info("pipeline_start", total_cases=len(cases), dry_run=dry_run)
 
     if dry_run:
-        return [{"case_id": c.id, "tipo": c.tipo_oficio, "cpf": c.cpf_cnpj, "status": "dry_run"} for c in cases]
+        return [
+            {"case_id": c.id, "tipo": c.tipo_oficio, "cpf": c.cpf_cnpj, "status": "dry_run"}
+            for c in cases
+        ]
 
     results = []
     for case in cases:

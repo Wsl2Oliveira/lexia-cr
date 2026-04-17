@@ -6,7 +6,7 @@
 -- CMD 1: Casos deduplicados (1 linha por processo, triagem mais recente)
 -- Cole este bloco no primeiro command do notebook
 
-WITH ranked AS (
+WITH exploded AS (
     SELECT
         ext.official_letter_extraction__created_at               AS data_recebimento,
         DATEDIFF(day, ext.official_letter_extraction__created_at, current_date()) AS dias_desde_recebimento,
@@ -15,6 +15,7 @@ WITH ranked AS (
         CASE ol.official_letter__type
             WHEN 'official_letter_type__block'    THEN 'BLOQUEIO'
             WHEN 'official_letter_type__dismiss'  THEN 'DESBLOQUEIO'
+            WHEN 'official_letter_type__transfer' THEN 'TRANSFERÊNCIA'
             ELSE ol.official_letter__type
         END                                                       AS tipo_legivel,
         ol.official_letter__type                                  AS tipo_oficio,
@@ -24,6 +25,9 @@ WITH ranked AS (
         ext.official_letter_extraction__process_document_number    AS numero_processo,
         ext.official_letter_extraction__court_tribunal_name        AS vara_tribunal,
         ext.official_letter_extraction__organ_name                 AS orgao_nome,
+
+        inv_exploded.inv_id                                        AS investigated_id,
+        inv_exploded.inv_pos                                       AS investigado_seq,
 
         name_pii.investigated_information__name                    AS nome_investigado,
         cpf_pii.investigated_information__cpf_cnpj                 AS cpf_cnpj,
@@ -36,10 +40,7 @@ WITH ranked AS (
         ext.official_letter_extraction__confirmed_or_rejected_by   AS triado_por,
         ext.official_letter_extraction__requested_information       AS info_solicitada,
 
-        ROW_NUMBER() OVER (
-            PARTITION BY ext.official_letter_extraction__process_document_number
-            ORDER BY ext.official_letter_extraction__confirmed_or_rejected_at DESC
-        ) AS rn
+        SIZE(ol.investigated_information__id)                       AS total_investigados
 
     FROM etl.br__dataset.jud_athena_official_letter_extractions ext
 
@@ -49,8 +50,10 @@ WITH ranked AS (
     INNER JOIN etl.br__dataset.jud_athena_official_letters ol
         ON ol.official_letter__submission_id = sub.submission__id
 
+    LATERAL VIEW POSEXPLODE(ol.investigated_information__id) inv_exploded AS inv_pos, inv_id
+
     LEFT JOIN etl.br__contract.jud_athena__investigated_information inv
-        ON inv.investigated_information__id = ol.investigated_information__id[0]
+        ON inv.investigated_information__id = inv_exploded.inv_id
 
     LEFT JOIN etl.br__contract.jud_athena__investigated_information_name_pii name_pii
         ON name_pii.hash = inv.investigated_information__name
@@ -61,16 +64,27 @@ WITH ranked AS (
     WHERE ext.official_letter_extraction__status = 'official_letter_extraction_status__confirmed'
       AND ol.official_letter__type IN (
           'official_letter_type__block',
-          'official_letter_type__dismiss'
+          'official_letter_type__dismiss',
+          'official_letter_type__transfer'
       )
       AND ext.official_letter_extraction__process_document_number IS NOT NULL
       AND ext.official_letter_extraction__created_at >= current_date() - INTERVAL 12 DAYS
+),
+
+ranked AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (
+            PARTITION BY numero_processo, investigated_id
+            ORDER BY triado_em DESC
+        ) AS rn
+    FROM exploded
 )
 
 SELECT *
 FROM ranked
 WHERE rn = 1
-ORDER BY data_recebimento DESC
+ORDER BY data_recebimento DESC, numero_processo, investigado_seq
 
 -- =============================================================================
 -- CMD 2: Resumo por tipo de ofício (cole em um novo command)

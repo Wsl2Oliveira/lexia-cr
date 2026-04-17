@@ -7,6 +7,7 @@ to a Google Sheets spreadsheet for QA review.
 Usage:
     python scripts/run_traced_pipeline.py
 """
+
 from __future__ import annotations
 
 import json
@@ -15,7 +16,8 @@ import secrets
 import ssl
 import string
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from itertools import groupby
 from pathlib import Path
 
 import gspread
@@ -31,26 +33,37 @@ from lexia.config import settings
 # Config
 # ---------------------------------------------------------------------------
 
-TARGET_PROCESSES = os.environ.get("LEXIA_TARGET_PROCESSES", "").split(",") if os.environ.get("LEXIA_TARGET_PROCESSES") else [
-    # Set via env var LEXIA_TARGET_PROCESSES (comma-separated) or edit this list
-]
+TARGET_PROCESSES = settings.target_processes.split(",") if settings.target_processes else []
 
-SPREADSHEET_ID = os.environ.get("LEXIA_SPREADSHEET_ID", "")
+SPREADSHEET_ID = settings.spreadsheet_id
 SHEET_NAME = "Relatorio_final"
 
 MESES_PT = [
-    "", "janeiro", "fevereiro", "março", "abril", "maio", "junho",
-    "julho", "agosto", "setembro", "outubro", "novembro", "dezembro",
+    "",
+    "janeiro",
+    "fevereiro",
+    "março",
+    "abril",
+    "maio",
+    "junho",
+    "julho",
+    "agosto",
+    "setembro",
+    "outubro",
+    "novembro",
+    "dezembro",
 ]
 
 HEADER_ROW = [
     "lexia_id",
+    "id_oficio",
     "numero_processo",
     "tipo_oficio",
     "info_solicitada",
     "numero_oficio",
     "nome_investigado",
     "cpf_cnpj",
+    "total_investigados",
     "vara_tribunal",
     "orgao_nome",
     "valor_solicitado",
@@ -91,8 +104,8 @@ def generate_lexia_id() -> str:
     return f"LX-{seg1}-{seg2}"
 
 
-def fetch_processed_processes() -> set[str]:
-    """Read the spreadsheet and return process numbers already completed."""
+def fetch_processed_oficios() -> set[str]:
+    """Read the spreadsheet and return id_oficio values already completed."""
     sa_path = settings.google_service_account_path
     if not sa_path or not Path(sa_path).exists() or not SPREADSHEET_ID:
         return set()
@@ -109,17 +122,17 @@ def fetch_processed_processes() -> set[str]:
         if len(records) < 2:
             return set()
         header = records[0]
-        processo_idx = header.index("numero_processo") if "numero_processo" in header else 1
+        oficio_idx = header.index("id_oficio") if "id_oficio" in header else 1
         status_idx = header.index("status_execucao") if "status_execucao" in header else -2
         return {
-            row[processo_idx]
+            row[oficio_idx]
             for row in records[1:]
-            if len(row) > max(processo_idx, status_idx)
-            and row[status_idx] == "success"
+            if len(row) > max(oficio_idx, status_idx) and row[status_idx] == "success"
         }
     except Exception as e:
-        print(f"  [WARN] Não foi possível ler processos já concluídos: {e}")
+        print(f"  [WARN] Não foi possível ler ofícios já concluídos: {e}")
         return set()
+
 
 LLM_SYSTEM_PROMPT = """\
 Você é um analista regulatório especializado em ordens judiciais da Nubank.
@@ -205,7 +218,7 @@ supra possui as seguintes posições na data desta resposta:\n\n\
 - Saldo em conta: R$ [saldo_conta]\n\
 - Fatura cartão de crédito (Valor a vencer + Valor vencido) R$ [valor_fatura]\n\
 - [Empréstimos: R$ X ou Não há empréstimos]\n\
-- [Não há seguro de vida / Não há investimentos / Não há criptoativos / Não há conta PJ / Não há conta Global]\n\n\
+- [Não há seguro de vida / Não há investimentos / Não há criptoativos / ...]\n\n\
 Ademais, oportuno esclarecer que as informações supra, referem-se à totalidade de \
 produtos contratados pelo(a) cliente na data desta resposta."
 
@@ -315,16 +328,32 @@ Responda APENAS com o JSON.
 # ---------------------------------------------------------------------------
 
 QUERY_BASE = """
-WITH ranked AS (
+WITH ol_exploded AS (
+    SELECT
+        ol.official_letter__id,
+        ol.official_letter__type,
+        ol.official_letter__status,
+        ol.official_letter__submission_id,
+        inv_pos,
+        inv_id,
+        SIZE(ol.investigated_information__id) AS total_investigados
+    FROM etl.br__dataset.jud_athena_official_letters ol
+    LATERAL VIEW POSEXPLODE(ol.investigated_information__id) AS inv_pos, inv_id
+),
+
+base AS (
     SELECT
         ext.official_letter_extraction__created_at               AS data_recebimento,
-        ol.official_letter__id                                    AS id_oficio,
-        ol.official_letter__type                                  AS tipo_oficio,
-        ol.official_letter__status                                AS status_oficio,
+        ole.official_letter__id                                   AS id_oficio,
+        ole.official_letter__type                                 AS tipo_oficio,
+        ole.official_letter__status                               AS status_oficio,
         ext.official_letter_extraction__craft_document_number      AS numero_oficio,
         ext.official_letter_extraction__process_document_number    AS numero_processo,
         ext.official_letter_extraction__court_tribunal_name        AS vara_tribunal,
         ext.official_letter_extraction__organ_name                 AS orgao_nome,
+        ole.inv_id                                                 AS investigated_id,
+        ole.inv_pos                                                AS investigado_seq,
+        ole.total_investigados,
         name_pii.investigated_information__name                    AS nome_investigado,
         cpf_pii.investigated_information__cpf_cnpj                 AS cpf_cnpj,
         inv.investigated_information__requested_value              AS valor_solicitado,
@@ -333,23 +362,18 @@ WITH ranked AS (
         ext.official_letter_extraction__is_reiteration             AS is_reiteracao,
         ext.official_letter_extraction__confirmed_or_rejected_at   AS triado_em,
         ext.official_letter_extraction__confirmed_or_rejected_by   AS triado_por,
-        ext.official_letter_extraction__requested_information       AS info_solicitada,
-
-        ROW_NUMBER() OVER (
-            PARTITION BY ext.official_letter_extraction__process_document_number
-            ORDER BY ext.official_letter_extraction__confirmed_or_rejected_at DESC
-        ) AS rn
+        ext.official_letter_extraction__requested_information       AS info_solicitada
 
     FROM etl.br__dataset.jud_athena_official_letter_extractions ext
 
     INNER JOIN etl.br__dataset.jud_athena_submissions sub
         ON ext.official_letter_extraction__submission_id = sub.submission__id
 
-    INNER JOIN etl.br__dataset.jud_athena_official_letters ol
-        ON ol.official_letter__submission_id = sub.submission__id
+    INNER JOIN ol_exploded ole
+        ON ole.official_letter__submission_id = sub.submission__id
 
     LEFT JOIN etl.br__contract.jud_athena__investigated_information inv
-        ON inv.investigated_information__id = ol.investigated_information__id[0]
+        ON inv.investigated_information__id = ole.inv_id
 
     LEFT JOIN etl.br__contract.jud_athena__investigated_information_name_pii name_pii
         ON name_pii.hash = inv.investigated_information__name
@@ -358,19 +382,29 @@ WITH ranked AS (
         ON cpf_pii.hash = inv.investigated_information__cpf_cnpj
 
     WHERE ext.official_letter_extraction__status = 'official_letter_extraction_status__confirmed'
-      AND ol.official_letter__type IN (
+      AND ole.official_letter__type IN (
           'official_letter_type__block',
           'official_letter_type__dismiss',
           'official_letter_type__transfer'
       )
       AND ext.official_letter_extraction__process_document_number IS NOT NULL
       {extra_filter}
+),
+
+ranked AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (
+            PARTITION BY id_oficio, investigated_id
+            ORDER BY triado_em DESC
+        ) AS rn
+    FROM base
 )
 
 SELECT *
 FROM ranked
 WHERE rn = 1
-ORDER BY data_recebimento DESC
+ORDER BY data_recebimento DESC, numero_processo, investigado_seq
 """
 
 
@@ -389,15 +423,21 @@ def fetch_cases_from_databricks(
         placeholders = ", ".join(f"'{p}'" for p in processes)
         extra = f"AND ext.official_letter_extraction__process_document_number IN ({placeholders})"
     else:
-        days = int(os.environ.get("DAYS_BACK", "12"))
-        extra = f"AND ext.official_letter_extraction__created_at >= current_date() - INTERVAL {days} DAYS"
+        days = int(os.environ.get("DAYS_BACK", "3"))
+        extra = (
+            f"AND ext.official_letter_extraction__created_at"
+            f" >= current_date() - INTERVAL {days} DAYS"
+        )
 
     query = QUERY_BASE.format(extra_filter=extra)
     if limit:
         query = query.rstrip().rstrip(";")
         query += f"\nLIMIT {limit}"
 
-    label = f"{len(processes)} processos" if processes else f"últimos casos (LIMIT {limit or 'ALL'})"
+    if processes:
+        label = f"{len(processes)} processos"
+    else:
+        label = f"últimos casos (LIMIT {limit or 'ALL'})"
     print(f"\n[FASE 1] Databricks — consultando {label}...")
     print(f"  Host: {settings.databricks_host}")
 
@@ -411,10 +451,12 @@ def fetch_cases_from_databricks(
             columns = [desc[0] for desc in cursor.description]
             rows = cursor.fetchall()
 
-    cases = [dict(zip(columns, row)) for row in rows]
+    cases = [dict(zip(columns, row, strict=False)) for row in rows]
     print(f"  ✓ {len(cases)} registros retornados (deduplicados)")
     for c in cases:
-        print(f"    • {c.get('numero_processo')} | {TIPO_MAP.get(c.get('tipo_oficio',''), c.get('tipo_oficio',''))} | {c.get('nome_investigado','N/A')}")
+        tipo = TIPO_MAP.get(c.get("tipo_oficio", ""), c.get("tipo_oficio", ""))
+        nome = c.get("nome_investigado", "N/A")
+        print(f"    • {c.get('numero_processo')} | {tipo} | {nome}")
 
     if processes:
         not_found = set(processes) - {c.get("numero_processo") for c in cases}
@@ -440,10 +482,8 @@ def _has_nu_auth() -> bool:
 def _get_nu_client() -> httpx.Client:
     """Build an httpx client with nucli certs + cached bearer token."""
     token = NU_TOKEN_PATH.read_text().strip()
-    ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ssl_ctx = ssl.create_default_context()
     ssl_ctx.load_cert_chain(str(NU_CERT_PATH), str(NU_KEY_PATH))
-    ssl_ctx.check_hostname = False
-    ssl_ctx.verify_mode = ssl.CERT_NONE
     return httpx.Client(
         verify=ssl_ctx,
         timeout=30,
@@ -481,9 +521,16 @@ def enrich_case(case: dict) -> dict:
     is_pj = len(clean_id) > 11
 
     if not _has_nu_auth():
-        for k in ["waze_shard", "customers_customer_id", "nuconta_status",
-                   "nuconta_saldo", "crebito_cartoes", "rayquaza_saldo",
-                   "petrificus_bloqueios", "dados_bancarios"]:
+        for k in [
+            "waze_shard",
+            "customers_customer_id",
+            "nuconta_status",
+            "nuconta_saldo",
+            "crebito_cartoes",
+            "rayquaza_saldo",
+            "petrificus_bloqueios",
+            "dados_bancarios",
+        ]:
             trace[k] = "CERTS_NAO_CONFIGURADOS"
         return trace
 
@@ -509,9 +556,13 @@ def enrich_case(case: dict) -> dict:
 
         # Customers — /company/ para PJ, /person/ para PF
         if is_pj:
-            cust_url = f"https://prod-{shard}-customers.nubank.com.br/api/customers/company/find-by-tax-id"
+            cust_url = (
+                f"https://prod-{shard}-customers.nubank.com.br/api/customers/company/find-by-tax-id"
+            )
         else:
-            cust_url = f"https://prod-{shard}-customers.nubank.com.br/api/customers/person/find-by-tax-id"
+            cust_url = (
+                f"https://prod-{shard}-customers.nubank.com.br/api/customers/person/find-by-tax-id"
+            )
 
         cust_resp = client.post(
             cust_url,
@@ -628,7 +679,9 @@ def enrich_case(case: dict) -> dict:
             else:
                 assets_resp.raise_for_status()
                 assets_data = assets_resp.json()
-                assets_list = assets_data if isinstance(assets_data, list) else assets_data.get("assets", [])
+                assets_list = (
+                    assets_data if isinstance(assets_data, list) else assets_data.get("assets", [])
+                )
                 trace["assets"] = assets_list
 
                 caixinhas_total = sum(
@@ -636,10 +689,7 @@ def enrich_case(case: dict) -> dict:
                     for a in assets_list
                     if a.get("kind") == "liquid_deposit"
                 )
-                total_seizable = sum(
-                    float(a.get("available_amount", 0) or 0)
-                    for a in assets_list
-                )
+                total_seizable = sum(float(a.get("available_amount", 0) or 0) for a in assets_list)
                 trace["rayquaza_saldo"] = json.dumps(
                     {
                         "ativos": [
@@ -669,7 +719,11 @@ def enrich_case(case: dict) -> dict:
             else:
                 blocks_resp.raise_for_status()
                 blocks_data = blocks_resp.json()
-                blocks_list = blocks_data if isinstance(blocks_data, list) else blocks_data.get("freeze_orders", [])
+                blocks_list = (
+                    blocks_data
+                    if isinstance(blocks_data, list)
+                    else blocks_data.get("freeze_orders", [])
+                )
                 trace["blocks"] = blocks_list
                 trace["petrificus_bloqueios"] = json.dumps(
                     [{"status": b.get("status"), "amount": b.get("amount")} for b in blocks_list],
@@ -688,7 +742,11 @@ def enrich_case(case: dict) -> dict:
             else:
                 mb_resp.raise_for_status()
                 mb_data = mb_resp.json()
-                boxes = mb_data if isinstance(mb_data, list) else mb_data.get("money_boxes", mb_data.get("moneyBoxes", []))
+                boxes = (
+                    mb_data
+                    if isinstance(mb_data, list)
+                    else mb_data.get("money_boxes", mb_data.get("moneyBoxes", []))
+                )
                 if isinstance(boxes, list):
                     trace["mario_box_caixinhas"] = json.dumps(
                         {
@@ -735,8 +793,14 @@ def enrich_case(case: dict) -> dict:
         client.close()
 
     except Exception as e:
-        for k in ["waze_shard", "customers_customer_id", "crebito_cartoes",
-                   "rayquaza_saldo", "petrificus_bloqueios", "dados_bancarios"]:
+        for k in [
+            "waze_shard",
+            "customers_customer_id",
+            "crebito_cartoes",
+            "rayquaza_saldo",
+            "petrificus_bloqueios",
+            "dados_bancarios",
+        ]:
             if trace[k] == "N/A":
                 trace[k] = f"ERRO: {e}"
 
@@ -746,6 +810,7 @@ def enrich_case(case: dict) -> dict:
 # ---------------------------------------------------------------------------
 # Phase 3 — LLM decision
 # ---------------------------------------------------------------------------
+
 
 def get_llm_decision(case: dict, enrichment: dict) -> dict:
     """Call LiteLLM for the macro decision and return trace data."""
@@ -776,7 +841,7 @@ def get_llm_decision(case: dict, enrichment: dict) -> dict:
     except (json.JSONDecodeError, TypeError):
         pass
 
-    THRESHOLD_INFIMO = 10.0
+    threshold_infimo = 10.0
     saldo_disponivel_raw = nuconta_saldo.get("available", "0")
     try:
         saldo_float = float(saldo_disponivel_raw) if saldo_disponivel_raw else 0.0
@@ -785,12 +850,10 @@ def get_llm_decision(case: dict, enrichment: dict) -> dict:
 
     tipo_oficio = TIPO_MAP.get(case.get("tipo_oficio", ""), case.get("tipo_oficio", ""))
     has_nuconta = nuconta_info.get("status") not in (None, "N/A", "not_found")
-    saldo_infimo = saldo_float < THRESHOLD_INFIMO
+    saldo_infimo = saldo_float < threshold_infimo
 
     blocks_raw = enrichment.get("blocks", [])
-    has_active_judicial_blocks = any(
-        b.get("status") not in ("dismissed", None) for b in blocks_raw
-    )
+    has_active_judicial_blocks = any(b.get("status") not in ("dismissed", None) for b in blocks_raw)
     has_credit_account = facade_info.get("account_status") not in (None, "N/A", "not_found")
     has_cards = bool(facade_info.get("cards"))
 
@@ -824,7 +887,7 @@ def get_llm_decision(case: dict, enrichment: dict) -> dict:
         pass
 
     saldo_combinado = max(saldo_total_rayquaza, saldo_float + saldo_caixinhas)
-    saldo_combinado_infimo = saldo_combinado < THRESHOLD_INFIMO
+    saldo_combinado_infimo = saldo_combinado < threshold_infimo
 
     # Parse info_solicitada (requested_information from Athena)
     info_solicitada_raw = case.get("info_solicitada")
@@ -856,7 +919,9 @@ def get_llm_decision(case: dict, enrichment: dict) -> dict:
         if customer_id_val in ("NAO_CLIENTE", "NOT_FOUND"):
             macro_hint = "Macro T2 — não é cliente (transferência)"
         elif saldo_combinado_infimo:
-            macro_hint = f"Macro T1 — conta zerada, transferência inviável (saldo R$ {saldo_combinado:.2f})"
+            macro_hint = (
+                f"Macro T1 — conta zerada, transferência inviável (saldo R$ {saldo_combinado:.2f})"
+            )
         else:
             macro_hint = f"Macro T3 — transferência viável (saldo R$ {saldo_combinado:.2f})"
 
@@ -881,9 +946,14 @@ def get_llm_decision(case: dict, enrichment: dict) -> dict:
                 else:
                     macro_hint = "Macro 2 — conta inexistente"
             elif saldo_combinado_infimo:
-                macro_hint = f"Macro 3 — saldo ínfimo (R$ {saldo_combinado:.2f} < R$ {THRESHOLD_INFIMO:.2f})"
+                macro_hint = (
+                    f"Macro 3 — saldo ínfimo (R$ {saldo_combinado:.2f} < R$ {threshold_infimo:.2f})"
+                )
             elif has_active_judicial_blocks:
-                macro_hint = f"Macro 5 — bloqueio com bloqueios anteriores ativos (saldo R$ {saldo_combinado:.2f})"
+                macro_hint = (
+                    f"Macro 5 — bloqueio com bloqueios anteriores ativos"
+                    f" (saldo R$ {saldo_combinado:.2f})"
+                )
             else:
                 macro_hint = f"Macro 4 — bloqueio padrão (saldo R$ {saldo_combinado:.2f})"
 
@@ -990,9 +1060,10 @@ def get_llm_decision(case: dict, enrichment: dict) -> dict:
         except Exception as e:
             last_error = e
             if attempt < max_retries:
-                wait = 2 ** attempt
-                print(f"    [LLM] Tentativa {attempt}/{max_retries} falhou, "
-                      f"retentando em {wait}s...")
+                wait = 2**attempt
+                print(
+                    f"    [LLM] Tentativa {attempt}/{max_retries} falhou, retentando em {wait}s..."
+                )
                 _time.sleep(wait)
 
     if last_error is not None:
@@ -1007,6 +1078,7 @@ def get_llm_decision(case: dict, enrichment: dict) -> dict:
 # ---------------------------------------------------------------------------
 # Phase 4 — Google Sheets
 # ---------------------------------------------------------------------------
+
 
 def write_to_sheets(rows: list[list[str]]) -> str | None:
     """Append data rows to the target Google Sheet (creates header if empty)."""
@@ -1041,6 +1113,7 @@ def write_to_sheets(rows: list[list[str]]) -> str | None:
 # ---------------------------------------------------------------------------
 # Phase 5 — Generate Google Docs via Apps Script
 # ---------------------------------------------------------------------------
+
 
 def _format_date_pt() -> str:
     now = datetime.now()
@@ -1100,12 +1173,158 @@ def _fix_ortografia(text: str) -> str:
     for wrong, correct in ACENTUACAO_CIDADES.items():
         if wrong in result.upper():
             import re
+
             result = re.sub(re.escape(wrong), correct, result, flags=re.IGNORECASE)
     return result
 
 
-def generate_doc(case: dict, llm_trace: dict) -> str | None:
+def _clean_macro_text(raw: str) -> str:
+    """Strip repeated header from macro text and force lowercase start."""
+    text = raw
+    for prefix in [
+        "Em atenção ao ofício judicial, informamos que ",
+        "Em atenção ao ofício judicial, ",
+        "em atenção ao ofício judicial, informamos que ",
+        "em atenção ao ofício judicial, ",
+    ]:
+        if text.lower().startswith(prefix.lower()):
+            text = text[len(prefix) :]
+            break
+    if text and text[0].isupper():
+        text = text[0].lower() + text[1:]
+    return _fix_ortografia(text)
+
+
+def build_generate_doc_replacements(
+    ref_case: dict,
+    inv_results: list[dict],
+) -> tuple[dict[str, str], list[str], str]:
+    """Build Apps Script replacement map and boldTexts (no HTTP)."""
+    tipo = TIPO_MAP.get(ref_case.get("tipo_oficio", ""), ref_case.get("tipo_oficio", ""))
+    processo = _sanitize(ref_case.get("numero_processo")) or "DESCONHECIDO"
+    doc_name = f"CR-{processo}-{tipo}"
+
+    macro_nao_cliente_coletiva = (
+        "em consulta aos dados fornecidos no r. ofício, cumpre-nos informar "
+        "que não identificamos em nossa base de clientes o(s) outro(s) "
+        "envolvido(s) citado(s)."
+    )
+
+    inv_data: list[dict] = []
+    macro_ids_seen: set[str] = set()
+
+    for inv in inv_results:
+        case = inv["case"]
+        llm_trace = inv["llm_trace"]
+        enrichment = inv["enrichment"]
+
+        nome = _fix_ortografia(_sanitize(case.get("nome_investigado")))
+        cpf_raw = _sanitize(case.get("cpf_cnpj"))
+        cpf_fmt = _format_cpf(cpf_raw)
+        digits = cpf_raw.replace(".", "").replace("-", "").replace("/", "")
+        dt = "CPF" if len(digits) <= 11 else "CNPJ"
+
+        macro_text = llm_trace.get("llm_texto_resposta", "")
+        if not macro_text or macro_text == "N/A":
+            macro_text = f"Macro: {llm_trace.get('llm_macro_aplicada', 'N/A')}"
+        macro_text = _clean_macro_text(macro_text)
+
+        is_nao_cliente = enrichment.get("customers_customer_id") in (
+            "NAO_CLIENTE",
+            "NOT_FOUND",
+        )
+
+        macro_ids_seen.add(llm_trace.get("llm_id_macro", ""))
+        inv_data.append(
+            {
+                "nome": nome,
+                "cpf_fmt": cpf_fmt,
+                "doc_type": dt,
+                "macro": macro_text,
+                "is_nao_cliente": is_nao_cliente,
+            }
+        )
+
+    first = inv_data[0]
+    same_macro = len(macro_ids_seen) == 1
+
+    bold_texts: list[str] = []
+    for d in inv_data:
+        bold_texts.append(f"{d['nome']} - {d['doc_type']} n.º {d['cpf_fmt']}")
+
+    if len(inv_data) == 1:
+        combined_name = first["nome"]
+        doc_type_label = first["doc_type"]
+        doc_field = first["cpf_fmt"]
+        combined_macro = first["macro"]
+    elif same_macro:
+        combined_name = first["nome"]
+        doc_type_label = first["doc_type"]
+        extra_lines = [f"{d['nome']} - {d['doc_type']} n.º {d['cpf_fmt']}" for d in inv_data[1:]]
+        doc_field = first["cpf_fmt"] + "\n\n" + "\n\n".join(extra_lines)
+        shared = first["macro"]
+        shared = shared.replace("em seu nome", "em nome dos investigados")
+        shared = shared.replace("seu nome", "nome dos investigados")
+        combined_macro = shared
+    else:
+        clientes = [d for d in inv_data if not d["is_nao_cliente"]]
+        nao_clientes = [d for d in inv_data if d["is_nao_cliente"]]
+
+        lead = clientes[0] if clientes else first
+        combined_name = lead["nome"]
+        doc_type_label = lead["doc_type"]
+        doc_field = lead["cpf_fmt"]
+
+        if clientes and nao_clientes:
+            parts: list[str] = []
+            for ci, d in enumerate(clientes):
+                if d is lead and ci == 0:
+                    parts.append(d["macro"])
+                else:
+                    parts.append(
+                        f"Em relação a {d['nome']} - {d['doc_type']} n.º {d['cpf_fmt']}, "
+                        f"informamos que {d['macro']}"
+                    )
+
+            nao_cli_names = " e ".join(
+                f"{d['nome']} - {d['doc_type']} n.º {d['cpf_fmt']}" for d in nao_clientes
+            )
+            parts.append(f"Em relação a {nao_cli_names}, {macro_nao_cliente_coletiva}")
+
+            combined_macro = "\n\n".join(parts)
+        else:
+            extra_parts = [
+                f"Em relação a {d['nome']} - {d['doc_type']} n.º {d['cpf_fmt']}, "
+                f"informamos que {d['macro']}"
+                for d in inv_data[1:]
+            ]
+            combined_macro = first["macro"] + "\n\n" + "\n\n".join(extra_parts)
+
+    vara = _fix_ortografia(_sanitize(ref_case.get("vara_tribunal")))
+    orgao = _fix_ortografia(_sanitize(ref_case.get("orgao_nome")))
+
+    replacements = {
+        "{{data da elaboração deste documento}}": _format_date_pt(),
+        "{{número do ofício}}": _sanitize(ref_case.get("numero_oficio")),
+        "{{número do processo}}": processo,
+        "{{Vara/Seccional}}": vara,
+        "{{Órgão (delegacia/tribunal)}}": orgao,
+        "{{NOME DO CLIENTE ATINGIDO}}": combined_name,
+        "CPF (CNPJ)": doc_type_label,
+        "{{documento do cliente atingido}}": doc_field,
+        "{{macro da operação realizada}}": combined_macro,
+    }
+
+    return replacements, bold_texts, doc_name
+
+
+def generate_doc(ref_case: dict, inv_results: list[dict]) -> str | None:
     """Call the Apps Script to create a filled letter in the Drive folder.
+
+    Args:
+        ref_case: Reference case dict (common fields: processo, vara, orgao, etc.).
+        inv_results: List of dicts, each with keys ``case``, ``enrichment``, ``llm_trace``
+            representing one investigated person in this ofício.
 
     Returns the Google Doc URL on success, or None on failure.
     """
@@ -1113,55 +1332,15 @@ def generate_doc(case: dict, llm_trace: dict) -> str | None:
         print("    ⚠ APPS_SCRIPT_URL não configurada, pulando geração de doc.")
         return None
 
-    tipo = TIPO_MAP.get(case.get("tipo_oficio", ""), case.get("tipo_oficio", ""))
-    processo = _sanitize(case.get("numero_processo")) or "DESCONHECIDO"
-    doc_name = f"CR-{processo}-{tipo}"
-
-    cpf_raw = _sanitize(case.get("cpf_cnpj"))
-    doc_type = "CPF" if len(cpf_raw.replace(".", "").replace("-", "").replace("/", "")) <= 11 else "CNPJ"
-
-    macro_text = llm_trace.get("llm_texto_resposta", "")
-    if not macro_text or macro_text == "N/A":
-        macro_text = f"Macro: {llm_trace.get('llm_macro_aplicada', 'N/A')}"
-
-    # Post-process: strip repeated header, force lowercase start
-    for prefix in [
-        "Em atenção ao ofício judicial, informamos que ",
-        "Em atenção ao ofício judicial, ",
-        "em atenção ao ofício judicial, informamos que ",
-        "em atenção ao ofício judicial, ",
-    ]:
-        if macro_text.lower().startswith(prefix.lower()):
-            macro_text = macro_text[len(prefix):]
-            break
-
-    if macro_text and macro_text[0].isupper():
-        macro_text = macro_text[0].lower() + macro_text[1:]
-
-    macro_text = _fix_ortografia(macro_text)
-
-    vara = _fix_ortografia(_sanitize(case.get("vara_tribunal")))
-    orgao = _fix_ortografia(_sanitize(case.get("orgao_nome")))
-    nome = _fix_ortografia(_sanitize(case.get("nome_investigado")))
-
-    replacements = {
-        "{{data da elaboração deste documento}}": _format_date_pt(),
-        "{{número do ofício}}": _sanitize(case.get("numero_oficio")),
-        "{{número do processo}}": processo,
-        "{{Vara/Seccional}}": vara,
-        "{{Órgão (delegacia/tribunal)}}": orgao,
-        "{{NOME DO CLIENTE ATINGIDO}}": nome,
-        "CPF (CNPJ)": doc_type,
-        "{{documento do cliente atingido}}": _format_cpf(cpf_raw),
-        "{{macro da operação realizada}}": macro_text,
-    }
+    replacements, bold_texts, doc_name = build_generate_doc_replacements(ref_case, inv_results)
 
     payload = {
         "templateId": settings.google_template_doc_id,
         "folderId": settings.google_drive_folder_id,
         "docName": doc_name,
-        "subfolderName": processo,
+        "subfolderName": _sanitize(ref_case.get("numero_processo")) or "DESCONHECIDO",
         "replacements": replacements,
+        "boldTexts": bold_texts,
     }
 
     try:
@@ -1185,6 +1364,29 @@ def generate_doc(case: dict, llm_trace: dict) -> str | None:
     except Exception as e:
         print(f"    ✗ Erro ao gerar doc: {e}")
         return None
+
+
+def group_cases_by_oficio(cases: list[dict]) -> list[dict]:
+    """Group flat case rows by id_oficio, deduplicating investigados."""
+    cases_sorted = sorted(cases, key=lambda c: c.get("id_oficio", ""))
+    grouped: list[dict] = []
+    for id_oficio, group_iter in groupby(cases_sorted, key=lambda c: c.get("id_oficio", "")):
+        investigados = list(group_iter)
+        seen: set[tuple[str, str]] = set()
+        unique: list[dict] = []
+        for inv in investigados:
+            key = (inv.get("nome_investigado", ""), inv.get("cpf_cnpj", ""))
+            if key not in seen:
+                seen.add(key)
+                unique.append(inv)
+        grouped.append(
+            {
+                "id_oficio": id_oficio,
+                "investigados": unique,
+                "ref_case": unique[0],
+            }
+        )
+    return grouped
 
 
 # ---------------------------------------------------------------------------
@@ -1242,11 +1444,15 @@ class SlackNotifier:
         """Persist today's thread_ts to cache file."""
         try:
             self._THREAD_TS_FILE.parent.mkdir(parents=True, exist_ok=True)
-            self._THREAD_TS_FILE.write_text(json.dumps({
-                "date": datetime.now().strftime("%Y-%m-%d"),
-                "thread_ts": thread_ts,
-                "channel": self._channel,
-            }))
+            self._THREAD_TS_FILE.write_text(
+                json.dumps(
+                    {
+                        "date": datetime.now().strftime("%Y-%m-%d"),
+                        "thread_ts": thread_ts,
+                        "channel": self._channel,
+                    }
+                )
+            )
         except Exception:
             pass
 
@@ -1308,10 +1514,11 @@ class SlackNotifier:
         self,
         processo: str,
         tipo: str,
-        macro_id: str,
+        inv_results: list[dict],
         doc_url: str | None,
         lexia_id: str = "",
     ):
+        """Notify success for an ofício with one or more investigados."""
         self._case_counter += 1
         doc_link = f"\n:page_facing_up:  <{doc_url}|Abrir Carta-Resposta>" if doc_url else ""
 
@@ -1320,19 +1527,33 @@ class SlackNotifier:
             "DESBLOQUEIO": ":unlock:",
             "TRANSFERÊNCIA": ":arrows_counterclockwise:",
         }.get(tipo, ":question:")
+
+        inv_lines = []
+        for inv in inv_results:
+            nome = inv["case"].get("nome_investigado", "N/A")
+            macro = inv["llm_trace"].get("llm_id_macro", "?")
+            inv_lines.append(f">  :bust_in_silhouette:  {nome} — Macro *{macro}*")
+        inv_block = "\n".join(inv_lines)
+
         msg = (
             f":white_check_mark:  *Caso {self._case_counter}/{self._total}*  `{lexia_id}`\n"
             f"\n"
             f">  *Processo:* `{processo}`\n"
             f">  {tipo_emoji}  *Tipo:* {tipo}\n"
-            f">  *Macro aplicada:* {macro_id}"
+            f">  *Investigados:* {len(inv_results)}\n"
+            f"{inv_block}"
             f"{doc_link}"
         )
         self._post(msg)
 
     def notify_case_error(
-        self, processo: str, tipo: str, error_key: str,
-        detail: str = "", lexia_id: str = "",
+        self,
+        processo: str,
+        tipo: str,
+        error_key: str,
+        detail: str = "",
+        lexia_id: str = "",
+        investigados: list[str] | None = None,
     ):
         self._case_counter += 1
         action = _ERROR_ACTION_MAP.get(error_key, "Investigar logs do pipeline.")
@@ -1343,22 +1564,36 @@ class SlackNotifier:
             "DESBLOQUEIO": ":unlock:",
             "TRANSFERÊNCIA": ":arrows_counterclockwise:",
         }.get(tipo, ":question:")
+
+        inv_line = ""
+        if investigados:
+            inv_line = f"\n>  *Investigados:* {', '.join(investigados)}"
+
         msg = (
             f":x:  *Caso {self._case_counter}/{self._total} — FALHA*  `{lexia_id}`\n"
             f"\n"
             f">  *Processo:* `{processo}`\n"
-            f">  {tipo_emoji}  *Tipo:* {tipo}\n"
+            f">  {tipo_emoji}  *Tipo:* {tipo}{inv_line}\n"
             f">  *Erro:* {error_key}{detail_line}\n"
             f"\n"
             f":warning:  *Ação necessária:* {action}"
         )
         self._post(msg)
 
-    def notify_case_certs_missing(self, processo: str, tipo: str, lexia_id: str = ""):
+    def notify_case_certs_missing(
+        self,
+        processo: str,
+        tipo: str,
+        lexia_id: str = "",
+        investigados: list[str] | None = None,
+    ):
         self.notify_case_error(
-            processo, tipo, "CERTS_NAO_CONFIGURADOS",
+            processo,
+            tipo,
+            "CERTS_NAO_CONFIGURADOS",
             "Certificados mTLS não encontrados no ambiente.",
             lexia_id,
+            investigados=investigados,
         )
 
     def finish(
@@ -1375,8 +1610,9 @@ class SlackNotifier:
         secs = int(duration_secs % 60)
         duration_str = f"{mins}m {secs:02d}s" if mins else f"{secs}s"
 
-        status_emoji = ":white_check_mark:" if not errors and not certs_missing else ":warning:"
-        status_text = "Concluída com sucesso" if not errors and not certs_missing else "Concluída com pendências"
+        has_issues = errors or certs_missing
+        status_emoji = ":warning:" if has_issues else ":white_check_mark:"
+        status_text = "Concluída com pendências" if has_issues else "Concluída com sucesso"
 
         result_lines = [f"  :white_check_mark:  Sucesso — *{succeeded}*"]
         if errors:
@@ -1402,6 +1638,7 @@ class SlackNotifier:
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main():
     import time as _time
 
@@ -1416,7 +1653,7 @@ def main():
         print(f"Processos: {len(processes)}")
     else:
         print(f"Modo: últimos casos (LIMIT {limit or 'ALL'})")
-    print(f"Timestamp: {datetime.now(timezone.utc).isoformat()}")
+    print(f"Timestamp: {datetime.now(UTC).isoformat()}")
     print("=" * 70)
 
     # Slack notifier
@@ -1432,138 +1669,193 @@ def main():
         print("\n❌ Nenhum caso encontrado no Databricks.")
         sys.exit(1)
 
-    # Deduplication — skip already-processed cases
-    print("\n[DEDUP] Verificando casos já processados...")
-    already_done = fetch_processed_processes()
+    # Deduplication — skip already-processed ofícios
+    print("\n[DEDUP] Verificando ofícios já processados...")
+    already_done = fetch_processed_oficios()
     skipped_count = 0
     if already_done:
         before = len(cases)
-        cases = [c for c in cases if c.get("numero_processo") not in already_done]
+        cases = [c for c in cases if c.get("id_oficio") not in already_done]
         skipped_count = before - len(cases)
         if skipped_count:
-            print(f"  ✓ {skipped_count} caso(s) já processado(s) — pulando")
+            print(f"  ✓ {skipped_count} linha(s) de ofícios já processados — pulando")
         if not cases:
-            print("\n✓ Todos os casos já foram processados anteriormente.")
+            print("\n✓ Todos os ofícios já foram processados anteriormente.")
             sys.exit(0)
-    print(f"  → {len(cases)} caso(s) a processar")
 
-    # Count by type for Slack breakdown
+    # Group rows by id_oficio (1 ofício = 1 carta-resposta)
+    grouped_cases = group_cases_by_oficio(cases)
+
+    print(f"  → {len(grouped_cases)} ofício(s) a processar ({len(cases)} linha(s) agrupadas)")
+
+    # Count by type per ofício for Slack breakdown
     n_bloqueio = sum(
-        1 for c in cases
-        if TIPO_MAP.get(c.get("tipo_oficio", ""), "") == "BLOQUEIO"
+        1
+        for g in grouped_cases
+        if TIPO_MAP.get(g["ref_case"].get("tipo_oficio", ""), "") == "BLOQUEIO"
     )
     n_desbloqueio = sum(
-        1 for c in cases
-        if TIPO_MAP.get(c.get("tipo_oficio", ""), "") == "DESBLOQUEIO"
+        1
+        for g in grouped_cases
+        if TIPO_MAP.get(g["ref_case"].get("tipo_oficio", ""), "") == "DESBLOQUEIO"
     )
     n_transferencia = sum(
-        1 for c in cases
-        if TIPO_MAP.get(c.get("tipo_oficio", ""), "") == "TRANSFERÊNCIA"
+        1
+        for g in grouped_cases
+        if TIPO_MAP.get(g["ref_case"].get("tipo_oficio", ""), "") == "TRANSFERÊNCIA"
     )
 
     slack.start_thread(
-        total=len(cases),
+        total=len(grouped_cases),
         bloqueio=n_bloqueio,
         desbloqueio=n_desbloqueio,
         transferencia=n_transferencia,
         skipped=skipped_count,
     )
 
-    all_rows = []
+    all_rows: list[list[str]] = []
 
-    for i, case in enumerate(cases, 1):
-        processo = case.get("numero_processo", "?")
-        tipo = TIPO_MAP.get(case.get("tipo_oficio", ""), case.get("tipo_oficio", ""))
+    for i, group in enumerate(grouped_cases, 1):
+        id_oficio = group["id_oficio"]
+        ref = group["ref_case"]
+        investigados = group["investigados"]
+        processo = ref.get("numero_processo", "?")
+        tipo = TIPO_MAP.get(ref.get("tipo_oficio", ""), ref.get("tipo_oficio", ""))
         lexia_id = generate_lexia_id()
-        print(f"\n{'—'*70}")
-        print(f"[{i}/{len(cases)}] {lexia_id} | Processo: {processo} ({tipo})")
-        print(f"  Investigado: {case.get('nome_investigado', 'N/A')}")
-        print(f"  CPF/CNPJ: {case.get('cpf_cnpj', 'N/A')}")
 
-        # Phase 2
-        print(f"\n  [FASE 2] APIs Nubank — enriquecimento...")
-        enrichment = enrich_case(case)
-        print(f"    Waze shard:    {enrichment['waze_shard']}")
-        print(f"    Customer ID:   {enrichment['customers_customer_id']}")
-        print(f"    NuConta:       {enrichment['nuconta_status'][:80]}")
-        print(f"    Saldo NuConta: {enrichment['nuconta_saldo'][:80]}")
-        print(f"    Crebito:       {enrichment['crebito_cartoes'][:80]}")
-        print(f"    Rayquaza:      {enrichment['rayquaza_saldo'][:80]}")
-        print(f"    Petrificus:    {enrichment['petrificus_bloqueios'][:80]}")
-        print(f"    Mario-Box:     {enrichment['mario_box_caixinhas'][:80]}")
-        print(f"    Dados Banc.:   {enrichment['dados_bancarios'][:80]}")
+        print(f"\n{'—' * 70}")
+        print(f"[{i}/{len(grouped_cases)}] {lexia_id} | Ofício: {id_oficio[:12]}...")
+        print(f"  Processo: {processo} ({tipo})")
+        print(f"  Investigados: {len(investigados)}")
 
-        # Phase 3
-        print(f"\n  [FASE 3] LLM — decisão da IA...")
-        llm_trace = get_llm_decision(case, enrichment)
-        print(f"    Macro:         {llm_trace['llm_macro_aplicada']}")
-        print(f"    ID Macro:      {llm_trace['llm_id_macro']}")
-        print(f"    Observações:   {llm_trace['llm_observacoes'][:100]}")
+        inv_results: list[dict] = []
+        overall_status = "success"
 
-        # Phase 5 — Generate Google Doc
-        print(f"\n  [FASE 5] Google Drive — gerando carta-resposta...")
-        doc_url = generate_doc(case, llm_trace)
+        for j, inv in enumerate(investigados, 1):
+            nome = inv.get("nome_investigado", "N/A")
+            cpf = inv.get("cpf_cnpj", "N/A")
+            print(f"\n  [{j}/{len(investigados)}] Investigado: {nome} | {cpf}")
 
-        status = "success"
-        if enrichment["waze_shard"] == "CERTS_NAO_CONFIGURADOS":
-            status = "certs_missing"
-        if llm_trace["llm_macro_aplicada"].startswith("ERRO"):
-            status = "error"
-        if not doc_url and status == "success":
-            status = "error"
+            # Phase 2 — Enrich
+            print("    [FASE 2] APIs Nubank — enriquecimento...")
+            enrichment = enrich_case(inv)
+            print(f"      Waze shard:    {enrichment['waze_shard']}")
+            print(f"      Customer ID:   {enrichment['customers_customer_id']}")
+            print(f"      NuConta:       {enrichment['nuconta_status'][:80]}")
+            print(f"      Saldo NuConta: {enrichment['nuconta_saldo'][:80]}")
+            print(f"      Crebito:       {enrichment['crebito_cartoes'][:80]}")
+            print(f"      Rayquaza:      {enrichment['rayquaza_saldo'][:80]}")
+            print(f"      Petrificus:    {enrichment['petrificus_bloqueios'][:80]}")
+            print(f"      Mario-Box:     {enrichment['mario_box_caixinhas'][:80]}")
+            print(f"      Dados Banc.:   {enrichment['dados_bancarios'][:80]}")
 
-        # Slack per-case notification
-        if status == "success":
-            slack.notify_case_success(
-                processo, tipo, llm_trace["llm_id_macro"], doc_url, lexia_id,
+            # Phase 3 — LLM decision
+            print("    [FASE 3] LLM — decisão da IA...")
+            llm_trace = get_llm_decision(inv, enrichment)
+            print(f"      Macro:         {llm_trace['llm_macro_aplicada']}")
+            print(f"      ID Macro:      {llm_trace['llm_id_macro']}")
+            print(f"      Observações:   {llm_trace['llm_observacoes'][:100]}")
+
+            if enrichment["waze_shard"] == "CERTS_NAO_CONFIGURADOS":
+                overall_status = "certs_missing"
+            if llm_trace["llm_macro_aplicada"].startswith("ERRO"):
+                overall_status = "error"
+
+            inv_results.append(
+                {
+                    "case": inv,
+                    "enrichment": enrichment,
+                    "llm_trace": llm_trace,
+                }
             )
-        elif status == "certs_missing":
-            slack.notify_case_certs_missing(processo, tipo, lexia_id)
+
+        # Phase 5 — Generate single Google Doc for this ofício
+        print("\n  [FASE 5] Google Drive — gerando carta-resposta...")
+        doc_url = generate_doc(ref, inv_results)
+
+        if not doc_url and overall_status == "success":
+            overall_status = "error"
+
+        # Slack per-ofício notification
+        inv_names = [inv.get("nome_investigado", "N/A") for inv in investigados]
+        if overall_status == "success":
+            slack.notify_case_success(
+                processo,
+                tipo,
+                inv_results,
+                doc_url,
+                lexia_id,
+            )
+        elif overall_status == "certs_missing":
+            slack.notify_case_certs_missing(processo, tipo, lexia_id, investigados=inv_names)
         else:
             error_key = "ERRO_LLM"
-            if llm_trace["llm_macro_aplicada"].startswith("ERRO_PARSE"):
+            any_parse = any(
+                r["llm_trace"]["llm_macro_aplicada"].startswith("ERRO_PARSE") for r in inv_results
+            )
+            if any_parse:
                 error_key = "ERRO_PARSE_JSON"
             elif not doc_url:
                 error_key = "NAO_GERADO"
+            first_obs = inv_results[0]["llm_trace"].get("llm_observacoes", "")[:200]
             slack.notify_case_error(
-                processo, tipo, error_key,
-                llm_trace.get("llm_observacoes", "")[:200],
+                processo,
+                tipo,
+                error_key,
+                first_obs,
                 lexia_id,
+                investigados=inv_names,
             )
 
-        info_sol = case.get("info_solicitada", "")
+        # Build single Sheet row for this ofício (concatenated fields)
+        info_sol = ref.get("info_solicitada", "")
         if isinstance(info_sol, list):
-            info_sol = ", ".join(str(i) for i in info_sol)
+            info_sol = ", ".join(str(x) for x in info_sol)
+
+        all_names = " | ".join(r["case"].get("nome_investigado", "") for r in inv_results)
+        all_cpfs = " | ".join(r["case"].get("cpf_cnpj", "") for r in inv_results)
+        all_macros = " | ".join(r["llm_trace"]["llm_macro_aplicada"] for r in inv_results)
+        all_macro_ids = " | ".join(r["llm_trace"]["llm_id_macro"] for r in inv_results)
+        all_macro_texts = " | ".join(r["llm_trace"]["llm_texto_resposta"] for r in inv_results)
+        all_obs = " | ".join(r["llm_trace"]["llm_observacoes"] for r in inv_results)
+        all_raw = " | ".join(r["llm_trace"]["llm_raw_response"] for r in inv_results)
+
+        first_enr = inv_results[0]["enrichment"]
+        all_vals = " | ".join(str(r["case"].get("valor_solicitado", "")) for r in inv_results)
+        all_is_cli = " | ".join(str(r["case"].get("is_cliente_nu", "")) for r in inv_results)
+
         row = [
             lexia_id,
-            str(case.get("numero_processo", "")),
+            str(id_oficio),
+            str(ref.get("numero_processo", "")),
             tipo,
             str(info_sol),
-            str(case.get("numero_oficio", "")),
-            str(case.get("nome_investigado", "")),
-            str(case.get("cpf_cnpj", "")),
-            str(case.get("vara_tribunal", "")),
-            str(case.get("orgao_nome", "")),
-            str(case.get("valor_solicitado", "")),
-            str(case.get("is_cliente_nu", "")),
-            str(case.get("data_recebimento", "")),
-            str(enrichment["waze_shard"]),
-            str(enrichment["customers_customer_id"]),
-            str(enrichment["nuconta_status"]),
-            str(enrichment["nuconta_saldo"]),
-            str(enrichment["mario_box_caixinhas"]),
-            str(enrichment["crebito_cartoes"]),
-            str(enrichment["rayquaza_saldo"]),
-            str(enrichment["petrificus_bloqueios"]),
-            str(enrichment["dados_bancarios"]),
-            str(llm_trace["llm_macro_aplicada"]),
-            str(llm_trace["llm_id_macro"]),
-            str(llm_trace["llm_texto_resposta"]),
-            str(llm_trace["llm_observacoes"]),
-            str(llm_trace["llm_raw_response"])[:2000],
+            str(ref.get("numero_oficio", "")),
+            all_names,
+            all_cpfs,
+            str(len(investigados)),
+            str(ref.get("vara_tribunal", "")),
+            str(ref.get("orgao_nome", "")),
+            all_vals,
+            all_is_cli,
+            str(ref.get("data_recebimento", "")),
+            str(first_enr["waze_shard"]),
+            str(first_enr["customers_customer_id"]),
+            str(first_enr["nuconta_status"]),
+            str(first_enr["nuconta_saldo"]),
+            str(first_enr["mario_box_caixinhas"]),
+            str(first_enr["crebito_cartoes"]),
+            str(first_enr["rayquaza_saldo"]),
+            str(first_enr["petrificus_bloqueios"]),
+            str(first_enr["dados_bancarios"]),
+            all_macros,
+            all_macro_ids,
+            all_macro_texts,
+            all_obs,
+            all_raw[:2000],
             doc_url or "NAO_GERADO",
-            status,
-            datetime.now(timezone.utc).isoformat(),
+            overall_status,
+            datetime.now(UTC).isoformat(),
         ]
         all_rows.append(row)
 
@@ -1573,8 +1865,8 @@ def main():
     except Exception as e:
         print(f"\n[FASE 4] ⚠ Erro ao gravar no Sheets (não impede finalização): {e}")
 
-    print(f"\n{'='*70}")
-    print(f"✓ Pipeline concluído — {len(all_rows)} casos processados")
+    print(f"\n{'=' * 70}")
+    print(f"✓ Pipeline concluído — {len(all_rows)} ofício(s) processados")
     succeeded = sum(1 for r in all_rows if r[-2] == "success")
     certs_missing = sum(1 for r in all_rows if r[-2] == "certs_missing")
     errors = sum(1 for r in all_rows if r[-2] == "error")

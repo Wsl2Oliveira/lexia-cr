@@ -1,4 +1,5 @@
 """Query jud_athena_* tables in Databricks for pending judicial cases."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -116,7 +117,7 @@ def fetch_pending_cases(days_back: int | None = None) -> list[JudicialCase]:
 
     cases = []
     for row in rows:
-        data = dict(zip(columns, row))
+        data = dict(zip(columns, row, strict=False))
         cases.append(
             JudicialCase(
                 id=data["id"],

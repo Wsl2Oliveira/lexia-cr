@@ -1,4 +1,5 @@
 """Find Active Cards — Crebito API."""
+
 from __future__ import annotations
 
 import structlog

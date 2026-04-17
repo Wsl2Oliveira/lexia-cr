@@ -1,4 +1,5 @@
 """Nubank internal API authentication — certificate-based + uber token."""
+
 from __future__ import annotations
 
 import ssl

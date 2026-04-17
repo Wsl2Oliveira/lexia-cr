@@ -1,4 +1,5 @@
 """Find Blocks (freeze orders) — Petrificus-Parcialus API."""
+
 from __future__ import annotations
 
 import structlog

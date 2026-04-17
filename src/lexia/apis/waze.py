@@ -1,4 +1,5 @@
 """Find Shard — Waze API (CPF → shard mapping)."""
+
 from __future__ import annotations
 
 import structlog

@@ -60,6 +60,12 @@ function _handleGenerate(data) {
       body.replaceText(escapeRegex(findText), value);
     }
   }
+
+  var boldTexts = data.boldTexts || [];
+  for (var b = 0; b < boldTexts.length; b++) {
+    _applyBoldToText(body, boldTexts[b]);
+  }
+
   doc.saveAndClose();
 
   var result = {
@@ -286,6 +292,17 @@ function _applyParaStyle(paragraph, style) {
   if (style.lineSpacing != null) paragraph.setLineSpacing(style.lineSpacing);
   paragraph.setSpacingBefore(style.spacingBefore || 6);
   paragraph.setSpacingAfter(style.spacingAfter || 0);
+}
+
+function _applyBoldToText(body, searchText) {
+  var found = body.findText(escapeRegex(searchText));
+  while (found) {
+    var element = found.getElement().asText();
+    var start = found.getStartOffset();
+    var end = found.getEndOffsetInclusive();
+    element.setBold(start, end, true);
+    found = body.findText(escapeRegex(searchText), found);
+  }
 }
 
 function escapeRegex(str) {

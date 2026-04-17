@@ -6,9 +6,9 @@ and writes the Drive link (or "não encontrado") to column X.
 Usage:
     python scripts/update_oficio_links.py
 """
+
 from __future__ import annotations
 
-import json
 import os
 import sys
 from pathlib import Path
@@ -23,7 +23,8 @@ from lexia.config import settings
 SPREADSHEET_ID = os.environ.get("LEXIA_SPREADSHEET_ID", "")
 SHEET_NAME = "Relatorio_final"
 APPS_SCRIPT_URL = settings.apps_script_url
-SEARCH_FOLDER_IDS = os.environ.get("LEXIA_SEARCH_FOLDER_IDS", "").split(",") if os.environ.get("LEXIA_SEARCH_FOLDER_IDS") else []
+_folder_ids_raw = os.environ.get("LEXIA_SEARCH_FOLDER_IDS", "")
+SEARCH_FOLDER_IDS = _folder_ids_raw.split(",") if _folder_ids_raw else []
 OFICIO_COL = "X"
 
 
@@ -72,7 +73,7 @@ def main():
     print(f"Header: {header[:5]}... ({len(header)} colunas)")
 
     processes = []
-    for i, row in enumerate(all_values[1:], start=2):
+    for _i, row in enumerate(all_values[1:], start=2):
         if row and row[0].strip():
             processes.append(row[0].strip())
 
@@ -103,7 +104,7 @@ def main():
     ws.update(range_name=f"{OFICIO_COL}1", values=updates)
     ws.format(f"{OFICIO_COL}1", {"textFormat": {"bold": True}})
 
-    print(f"\n✓ Coluna {OFICIO_COL} atualizada com {len(updates)-1} links.")
+    print(f"\n✓ Coluna {OFICIO_COL} atualizada com {len(updates) - 1} links.")
     print(f"  Planilha: https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit")
 
 

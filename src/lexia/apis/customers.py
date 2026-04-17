@@ -1,4 +1,5 @@
 """Find Customer ID — Customers API (tax ID → customer ID)."""
+
 from __future__ import annotations
 
 import structlog
