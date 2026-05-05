@@ -62,6 +62,68 @@ def test_clean_macro_text_pass_through():
     assert rtp._clean_macro_text("já começa em minúsculas.") == "já começa em minúsculas."
 
 
+@pytest.mark.parametrize(
+    ("vara", "orgao", "expected_vara", "expected_orgao"),
+    [
+        (
+            "Poder Judiciário TJ-RS 2ª Vara Cível de Bento Gonçalves",
+            "Poder Judiciário TJ-RS 2ª Vara Cível de Bento Gonçalves",
+            "Poder Judiciário TJ-RS 2ª Vara Cível de Bento Gonçalves",
+            "",
+        ),
+        (
+            "  Poder Judiciário TJ-RS  ",
+            "poder judiciário tj-rs",
+            "  Poder Judiciário TJ-RS  ",
+            "",
+        ),
+        (
+            "TJ-RS — 2ª Vara Cível de Bento Gonçalves",
+            "TJ-RS",
+            "TJ-RS — 2ª Vara Cível de Bento Gonçalves",
+            "",
+        ),
+        (
+            "TJ-RS",
+            "TJ-RS — 2ª Vara Cível de Bento Gonçalves",
+            "TJ-RS — 2ª Vara Cível de Bento Gonçalves",
+            "",
+        ),
+        (
+            "1ª Vara Cível de São Paulo",
+            "Tribunal de Justiça do Estado de São Paulo",
+            "1ª Vara Cível de São Paulo",
+            "Tribunal de Justiça do Estado de São Paulo",
+        ),
+        ("Vara X", "", "Vara X", ""),
+        ("", "Órgão Y", "", "Órgão Y"),
+    ],
+)
+def test_dedupe_orgao(vara, orgao, expected_vara, expected_orgao):
+    out_vara, out_orgao = rtp._dedupe_orgao(vara, orgao)
+    assert out_vara == expected_vara
+    assert out_orgao == expected_orgao
+
+
+def test_build_replacements_dedups_duplicated_header():
+    ref = {
+        "numero_processo": "0001",
+        "numero_oficio": "OF-1",
+        "vara_tribunal": "Poder Judiciário TJ-RS 2ª Vara Cível de Bento Gonçalves",
+        "orgao_nome": "Poder Judiciário TJ-RS 2ª Vara Cível de Bento Gonçalves",
+    }
+    invs = [
+        {
+            "case": {"nome_investigado": "Fulano", "cpf_cnpj": "12345678901"},
+            "enrichment": {},
+            "llm_trace": {"id_macro": "1", "macro_aplicada": "Macro X", "texto_resposta": "ok."},
+        },
+    ]
+    replacements, _, _ = rtp.build_generate_doc_replacements(ref, invs)
+    assert replacements["{{Vara/Seccional}}"].endswith("Bento Gonçalves")
+    assert replacements["{{Órgão (delegacia/tribunal)}}"] == ""
+
+
 def test_group_by_id_oficio_two_rows_same_oficio_two_investigados():
     cases = [
         {"id_oficio": "o1", "nome_investigado": "A", "cpf_cnpj": "1"},
@@ -142,6 +204,9 @@ def test_generate_doc_replacements_single_investigado():
 
 
 def test_generate_doc_replacements_same_macro_multiple_investigados():
+    """Mesma macro: cada investigado adicional precisa receber seu próprio
+    bloco "Em relação a ..." no campo da macro, e o campo "documento" deve
+    conter apenas o CPF do primeiro (os demais entram no bloco da macro)."""
     ref = {
         "tipo_oficio": "official_letter_type__block",
         "numero_processo": "0001",
@@ -155,11 +220,48 @@ def test_generate_doc_replacements_same_macro_multiple_investigados():
         _inv("Bia", "98765432100", macro_text=macro, macro_id="M1"),
     ]
     replacements, bold_texts, _doc_name = rtp.build_generate_doc_replacements(ref, invs)
-    assert "nome dos investigados" in replacements["{{macro da operação realizada}}"].lower()
     doc_field = replacements["{{documento do cliente atingido}}"]
-    assert "123.456.789-01" in doc_field
-    assert "Bia" in doc_field
+    assert doc_field == "123.456.789-01"
+    assert "Bia" not in doc_field
+    macro_block = replacements["{{macro da operação realizada}}"]
+    assert macro_block.lower().startswith("há conta ativa em seu nome.")
+    assert "Em relação a Bia - CPF n.º 987.654.321-00" in macro_block
+    assert macro_block.lower().count("há conta ativa em seu nome.") == 2
     assert len(bold_texts) == 2
+
+
+def test_generate_doc_replacements_same_macro_id_distinct_texts():
+    """Bug histórico (linha 52 da prod 23/04/2026): macro_id igual mas textos
+    diferentes (saldos distintos por investigado) faziam o texto do segundo
+    sumir. Agora cada investigado precisa aparecer com seu próprio texto."""
+    ref = {
+        "tipo_oficio": "official_letter_type__block",
+        "numero_processo": "0001",
+        "numero_oficio": "OF-1",
+        "vara_tribunal": "S/N",
+        "orgao_nome": "S/N",
+    }
+    invs = [
+        _inv(
+            "EZEQUIAS LTDA",
+            "09651926000111",
+            macro_text="foi bloqueado o importe disponível de R$ 38,27.",
+            macro_id="4",
+        ),
+        _inv(
+            "Ezequias",
+            "30310955882",
+            macro_text="foi bloqueado o importe disponível de R$ 422,26.",
+            macro_id="4",
+        ),
+    ]
+    replacements, _bold, _ = rtp.build_generate_doc_replacements(ref, invs)
+    macro_block = replacements["{{macro da operação realizada}}"]
+    assert "R$ 38,27" in macro_block
+    assert "R$ 422,26" in macro_block, (
+        "Texto diferente do segundo investigado precisa aparecer no doc"
+    )
+    assert "Em relação a Ezequias - CPF n.º 303.109.558-82" in macro_block
 
 
 def test_generate_doc_replacements_different_macros():

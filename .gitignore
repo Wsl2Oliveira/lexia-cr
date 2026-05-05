@@ -29,3 +29,7 @@ tmp/
 
 # Apps Script credentials
 apps-script/.clasp.json
+
+# macOS metadata
+.DS_Store
+**/.DS_Store

@@ -16,11 +16,13 @@ import secrets
 import ssl
 import string
 import sys
+import time
 from datetime import UTC, datetime
 from itertools import groupby
 from pathlib import Path
 
 import gspread
+from gspread.utils import rowcol_to_a1
 import httpx
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
@@ -28,6 +30,19 @@ from slack_sdk import WebClient as SlackWebClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from lexia.config import settings
+from lexia.deterministic import decide as deterministic_decide
+from lexia.monitoring import (
+    ERROR_ACTIONS,
+    CaseRecord,
+    ErrorCategory,
+    RunSummary,
+    SLOReport,
+    SLOTargets,
+    categorize_case_error,
+    compute_slo_report,
+    write_run_summary_json,
+)
+from lexia.preflight import ensure_nu_auth
 
 # ---------------------------------------------------------------------------
 # Config
@@ -37,6 +52,12 @@ TARGET_PROCESSES = settings.target_processes.split(",") if settings.target_proce
 
 SPREADSHEET_ID = settings.spreadsheet_id
 SHEET_NAME = "Relatorio_final"
+
+IS_DRY_RUN = os.getenv("LEXIA_DRY_RUN", "").lower() in ("true", "1", "yes")
+if IS_DRY_RUN:
+    print("=" * 60)
+    print("[DRY-RUN] Modo simulação ATIVO — Slack/Drive/Sheets não serão tocados.")
+    print("=" * 60)
 
 MESES_PT = [
     "",
@@ -86,6 +107,19 @@ HEADER_ROW = [
     "doc_url",
     "status_execucao",
     "timestamp_execucao",
+    # --- Responsiveness monitoring (JUD-1995) ---
+    "started_at",
+    "duration_secs",
+    "error_category",
+    # --- Deterministic engine bookkeeping (shadow/hybrid/deterministic modes) ---
+    "det_id_macro",
+    "det_macro_aplicada",
+    "det_texto_resposta",
+    "det_decision_source",
+    "det_match_macro",
+    "det_match_text_similarity",
+    "det_confidence",
+    "det_decision_reason",
 ]
 
 TIPO_MAP = {
@@ -476,11 +510,38 @@ NU_TOKEN_PATH = Path.home() / "dev/nu/.nu/tokens/br/prod/access"
 
 
 def _has_nu_auth() -> bool:
+    """Verifica se há tokens/certs em disco, com auto-refresh silencioso prévio.
+
+    Antes de checar a existência dos arquivos, dispara `nu auth get-access-token`
+    via ``ensure_nu_auth()``. Isso renova o access token (e o refresh token,
+    quando aplicável) sem prompt 2FA, evitando que o pipeline falhe quando o
+    operador não rodou ``nucli`` recentemente.
+
+    A intervenção manual (com 2FA) só é necessária quando o refresh-token
+    também expira — tipicamente uma vez por mês.
+    """
+    refresh_ok, refresh_reason = ensure_nu_auth()
+    if not refresh_ok:
+        print(f"[PREFLIGHT] auto-refresh do nucli falhou: {refresh_reason}")
     return NU_CERT_PATH.exists() and NU_KEY_PATH.exists() and NU_TOKEN_PATH.exists()
 
 
 def _get_nu_client() -> httpx.Client:
-    """Build an httpx client with nucli certs + cached bearer token."""
+    """Build an httpx client with nucli certs + cached bearer token.
+
+    Garante token válido via ``ensure_nu_auth()`` antes de ler do disco.
+    Se o refresh-token também tiver expirado, levanta RuntimeError com ação
+    clara para o operador (rodar ``nucli`` com 2FA).
+    """
+    refresh_ok, refresh_reason = ensure_nu_auth()
+    if not refresh_ok:
+        raise RuntimeError(
+            "[NU CLIENT] Não foi possível garantir token válido via "
+            f"`nu auth get-access-token`: {refresh_reason}. "
+            "Refresh-token provavelmente expirou. Ação: rodar `nucli` no "
+            "terminal (com 2FA) para regenerar tokens."
+        )
+
     token = NU_TOKEN_PATH.read_text().strip()
     ssl_ctx = ssl.create_default_context()
     ssl_ctx.load_cert_chain(str(NU_CERT_PATH), str(NU_KEY_PATH))
@@ -492,6 +553,87 @@ def _get_nu_client() -> httpx.Client:
             "Content-Type": "application/json",
         },
     )
+
+
+# Status codes que justificam retry: 5xx (instabilidade do servidor) e 429
+# (rate limit). 4xx restantes são respostas válidas do servidor (CPF inválido,
+# token expirado, etc.) e não devem ser retentados.
+_NU_RETRY_STATUS = {429, 500, 502, 503, 504}
+
+# Exceções de transporte que indicam falha transitória de rede.
+_NU_RETRY_EXC = (
+    httpx.TimeoutException,
+    httpx.ConnectError,
+    httpx.ReadError,
+    httpx.WriteError,
+    httpx.RemoteProtocolError,
+    httpx.PoolTimeout,
+)
+
+
+def _nu_request(
+    client: httpx.Client,
+    method: str,
+    url: str,
+    *,
+    json_body: dict | None = None,
+    params: dict | None = None,
+    retries: int = 2,
+    backoff: tuple[float, ...] = (1.0, 3.0),
+    label: str = "",
+) -> httpx.Response:
+    """Wrap a Nubank internal API call with bounded retry on transient failures.
+
+    Retries up to ``retries`` extra attempts (default: 1 + 2 = 3 total) on:
+      - Transport errors (timeout, connection drop, protocol error).
+      - HTTP 429 (rate limit) and 5xx (server-side errors).
+
+    Does NOT retry on 4xx (except 429): those are deterministic server answers
+    (404 = not customer, 400 = bad payload, 401/403 = auth) where retrying
+    would only burn time.
+
+    The caller still receives a normal :class:`httpx.Response` and is expected
+    to handle business statuses (e.g. ``status_code == 404``) explicitly.
+    """
+    last_exc: Exception | None = None
+    last_resp: httpx.Response | None = None
+    total_attempts = retries + 1
+    tag = f"[NU{(' ' + label) if label else ''}]"
+
+    for attempt in range(1, total_attempts + 1):
+        try:
+            resp = client.request(method, url, json=json_body, params=params)
+        except _NU_RETRY_EXC as exc:
+            last_exc = exc
+            if attempt < total_attempts:
+                wait = backoff[min(attempt - 1, len(backoff) - 1)]
+                print(
+                    f"      {tag} {type(exc).__name__} em '{url}' "
+                    f"(tentativa {attempt}/{total_attempts}), retentando em {wait:.1f}s..."
+                )
+                time.sleep(wait)
+                continue
+            raise
+
+        if resp.status_code in _NU_RETRY_STATUS and attempt < total_attempts:
+            last_resp = resp
+            wait = backoff[min(attempt - 1, len(backoff) - 1)]
+            if resp.status_code == 429:
+                wait = max(wait, 5.0)
+            print(
+                f"      {tag} HTTP {resp.status_code} em '{url}' "
+                f"(tentativa {attempt}/{total_attempts}), retentando em {wait:.1f}s..."
+            )
+            time.sleep(wait)
+            continue
+
+        return resp
+
+    if last_resp is not None:
+        return last_resp
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"_nu_request: estado inesperado para {url}")
 
 
 def enrich_case(case: dict) -> dict:
@@ -545,7 +687,9 @@ def enrich_case(case: dict) -> dict:
             waze_url = "https://prod-global-waze.nubank.com.br/api/mapping/cpf"
             waze_payload = {"cpf": clean_id}
 
-        waze_resp = client.post(waze_url, json=waze_payload)
+        waze_resp = _nu_request(
+            client, "POST", waze_url, json_body=waze_payload, label="Waze"
+        )
         waze_resp.raise_for_status()
         shard = waze_resp.json().get("shard")
         trace["waze_shard"] = shard or "NOT_FOUND"
@@ -564,9 +708,12 @@ def enrich_case(case: dict) -> dict:
                 f"https://prod-{shard}-customers.nubank.com.br/api/customers/person/find-by-tax-id"
             )
 
-        cust_resp = client.post(
+        cust_resp = _nu_request(
+            client,
+            "POST",
             cust_url,
-            json={"tax_id": clean_id},
+            json_body={"tax_id": clean_id},
+            label="Customers",
         )
         if cust_resp.status_code == 404:
             trace["customers_customer_id"] = "NAO_CLIENTE"
@@ -585,8 +732,11 @@ def enrich_case(case: dict) -> dict:
         # savings-accounts — verifica se tem NuConta
         savings_account_id = None
         try:
-            sa_resp = client.get(
-                f"https://prod-{shard}-savings-accounts.nubank.com.br/api/customer/{customer_id}/savings-account"
+            sa_resp = _nu_request(
+                client,
+                "GET",
+                f"https://prod-{shard}-savings-accounts.nubank.com.br/api/customer/{customer_id}/savings-account",
+                label="Savings",
             )
             if sa_resp.status_code == 404:
                 trace["nuconta_status"] = "SEM_NUCONTA"
@@ -610,8 +760,11 @@ def enrich_case(case: dict) -> dict:
         if savings_account_id:
             try:
                 today = datetime.now().strftime("%Y-%m-%d")
-                diablo_resp = client.get(
-                    f"https://prod-{shard}-diablo.nubank.com.br/api/savings-accounts/{savings_account_id}/balance/{today}"
+                diablo_resp = _nu_request(
+                    client,
+                    "GET",
+                    f"https://prod-{shard}-diablo.nubank.com.br/api/savings-accounts/{savings_account_id}/balance/{today}",
+                    label="Diablo",
                 )
                 if diablo_resp.status_code == 404:
                     trace["nuconta_saldo"] = "SEM_SALDO"
@@ -634,8 +787,11 @@ def enrich_case(case: dict) -> dict:
 
         # Facade (cartões + conta crédito) — mais completo que Crebito
         try:
-            facade_resp = client.get(
-                f"https://prod-{shard}-facade.nubank.com.br/api/customers/{customer_id}/account"
+            facade_resp = _nu_request(
+                client,
+                "GET",
+                f"https://prod-{shard}-facade.nubank.com.br/api/customers/{customer_id}/account",
+                label="Facade",
             )
             if facade_resp.status_code == 404:
                 trace["crebito_cartoes"] = "SEM_CONTA_CREDITO"
@@ -671,8 +827,11 @@ def enrich_case(case: dict) -> dict:
 
         # Rayquaza — available-assets (includes NuConta + caixinhas/liquid_deposit)
         try:
-            assets_resp = client.get(
-                f"https://prod-{shard}-rayquaza.nubank.com.br/api/customers/{customer_id}/available-assets"
+            assets_resp = _nu_request(
+                client,
+                "GET",
+                f"https://prod-{shard}-rayquaza.nubank.com.br/api/customers/{customer_id}/available-assets",
+                label="Rayquaza",
             )
             if assets_resp.status_code == 404:
                 trace["rayquaza_saldo"] = "SEM_ATIVOS"
@@ -711,8 +870,11 @@ def enrich_case(case: dict) -> dict:
 
         # Petrificus
         try:
-            blocks_resp = client.get(
-                f"https://prod-{shard}-petrificus-parcialus.nubank.com.br/api/customers/{customer_id}/freeze-orders"
+            blocks_resp = _nu_request(
+                client,
+                "GET",
+                f"https://prod-{shard}-petrificus-parcialus.nubank.com.br/api/customers/{customer_id}/freeze-orders",
+                label="Petrificus",
             )
             if blocks_resp.status_code == 404:
                 trace["petrificus_bloqueios"] = "SEM_BLOQUEIOS"
@@ -734,8 +896,11 @@ def enrich_case(case: dict) -> dict:
 
         # Mario-Box — Caixinhas metadata (nomes, sem saldo — saldo vem do Rayquaza)
         try:
-            mb_resp = client.get(
-                f"https://prod-{shard}-mario-box.nubank.com.br/api/customers/{customer_id}/money-boxes"
+            mb_resp = _nu_request(
+                client,
+                "GET",
+                f"https://prod-{shard}-mario-box.nubank.com.br/api/customers/{customer_id}/money-boxes",
+                label="MarioBox",
             )
             if mb_resp.status_code == 404:
                 trace["mario_box_caixinhas"] = "SEM_CAIXINHAS"
@@ -763,13 +928,16 @@ def enrich_case(case: dict) -> dict:
         # Bank-accounts-widget-provider — agência e conta (se tem savings-account)
         if savings_account_id:
             try:
-                ba_resp = client.get(
+                ba_resp = _nu_request(
+                    client,
+                    "GET",
                     "https://prod-global-bank-accounts-widget-provider.nubank.com.br"
                     "/api/savings-accounts/resources/country-data",
                     params={
                         "customer-id": customer_id,
                         "savings-account-id": savings_account_id,
                     },
+                    label="BankAccounts",
                 )
                 if ba_resp.status_code == 200:
                     ba_data = ba_resp.json()
@@ -1018,7 +1186,12 @@ def get_llm_decision(case: dict, enrichment: dict) -> dict:
 
     import time as _time
 
-    max_retries = 3
+    # Throttle pré-chamada: suaviza pico para evitar rate limit (3 RPM observado)
+    _time.sleep(8)
+
+    # Fail-fast: 1 tentativa + 1 retry curto. Casos que falharem serão reprocessados manualmente.
+    max_retries = 2
+    backoff_secs = [5, 5]
     last_error = None
 
     for attempt in range(1, max_retries + 1):
@@ -1031,11 +1204,16 @@ def get_llm_decision(case: dict, enrichment: dict) -> dict:
             response = client.chat.completions.create(
                 model=settings.litellm_model,
                 messages=[
-                    {"role": "system", "content": LLM_SYSTEM_PROMPT},
+                    {
+                        "role": "system",
+                        "content": LLM_SYSTEM_PROMPT,
+                        "cache_control": {"type": "ephemeral"},
+                    },
                     {"role": "user", "content": user_message},
                 ],
                 temperature=0.2,
-                max_tokens=4096,
+                max_tokens=1024,
+                response_format={"type": "json_object"},
             )
 
             raw = response.choices[0].message.content.strip()
@@ -1059,10 +1237,13 @@ def get_llm_decision(case: dict, enrichment: dict) -> dict:
 
         except Exception as e:
             last_error = e
+            err_str = str(e)
+            is_rate_limit = "429" in err_str or "RateLimit" in err_str or "rate_limit" in err_str
             if attempt < max_retries:
-                wait = 2**attempt
+                wait = backoff_secs[attempt - 1]
+                tag = "[LLM][429]" if is_rate_limit else "[LLM]"
                 print(
-                    f"    [LLM] Tentativa {attempt}/{max_retries} falhou, retentando em {wait}s..."
+                    f"    {tag} Tentativa {attempt}/{max_retries} falhou, retentando em {wait}s..."
                 )
                 _time.sleep(wait)
 
@@ -1076,12 +1257,106 @@ def get_llm_decision(case: dict, enrichment: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Decision dispatcher (LLM vs deterministic vs shadow vs hybrid)
+# ---------------------------------------------------------------------------
+
+
+def _text_similarity(a: str, b: str) -> float:
+    """Return a 0..1 similarity ratio between two strings (difflib)."""
+    from difflib import SequenceMatcher
+
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def _empty_det_trace(reason: str = "not_run") -> dict:
+    return {
+        "llm_macro_aplicada": "",
+        "llm_id_macro": "",
+        "llm_texto_resposta": "",
+        "llm_observacoes": "",
+        "llm_raw_response": f"[deterministic skipped: {reason}]",
+        "decision_source": "skipped",
+        "confidence": "N/A",
+        "decision_reason": reason,
+    }
+
+
+def get_decision(case: dict, enrichment: dict) -> dict:
+    """Dispatch between LLM and deterministic engine based on ``decision_mode``.
+
+    Returns a trace dict in the same shape as ``get_llm_decision`` plus extra
+    bookkeeping fields used by Sheets and the shadow-comparison report:
+
+        - ``decision_source``: "llm" | "deterministic" | "llm_fallback"
+        - ``confidence``:      "HIGH" | "LOW" | "N/A"
+        - ``decision_reason``: short trace
+        - ``det_*``:           per-mode shadow trace (when applicable)
+    """
+    mode = settings.decision_mode
+
+    if mode == "llm":
+        trace = get_llm_decision(case, enrichment)
+        trace.setdefault("decision_source", "llm")
+        trace.setdefault("confidence", "N/A")
+        trace.setdefault("decision_reason", "LLM-only mode")
+        trace["det_trace"] = _empty_det_trace("mode=llm")
+        return trace
+
+    if mode == "deterministic":
+        det_trace = deterministic_decide(case, enrichment)
+        if det_trace["confidence"] == "LOW" or det_trace["llm_macro_aplicada"].startswith("ERRO"):
+            det_trace["llm_macro_aplicada"] = "ERRO_DETERMINISTIC_LOW_CONFIDENCE"
+            det_trace["llm_observacoes"] = (
+                f"Modo determinístico-only: {det_trace.get('decision_reason', '')}"
+            )
+        det_trace["det_trace"] = dict(det_trace)
+        return det_trace
+
+    if mode == "hybrid":
+        det_trace = deterministic_decide(case, enrichment)
+        if det_trace["confidence"] == "HIGH" and not det_trace["llm_macro_aplicada"].startswith("ERRO"):
+            det_trace["det_trace"] = dict(det_trace)
+            return det_trace
+
+        print(
+            f"    [HYBRID] confidence={det_trace['confidence']} → fallback p/ LLM "
+            f"(motivo: {det_trace.get('decision_reason', '?')})"
+        )
+        llm_trace = get_llm_decision(case, enrichment)
+        llm_trace["decision_source"] = "llm_fallback"
+        llm_trace["confidence"] = det_trace["confidence"]
+        llm_trace["decision_reason"] = (
+            f"Fallback LLM (det.confidence={det_trace['confidence']}): "
+            f"{det_trace.get('decision_reason', '')}"
+        )
+        llm_trace["det_trace"] = det_trace
+        return llm_trace
+
+    # mode == "shadow": run both, USE the LLM result, attach det_* for comparison
+    det_trace = deterministic_decide(case, enrichment)
+    llm_trace = get_llm_decision(case, enrichment)
+    llm_trace.setdefault("decision_source", "llm")
+    llm_trace.setdefault("confidence", "N/A")
+    llm_trace.setdefault("decision_reason", "shadow mode (LLM authoritative)")
+    llm_trace["det_trace"] = det_trace
+    return llm_trace
+
+
+# ---------------------------------------------------------------------------
 # Phase 4 — Google Sheets
 # ---------------------------------------------------------------------------
 
 
 def write_to_sheets(rows: list[list[str]]) -> str | None:
     """Append data rows to the target Google Sheet (creates header if empty)."""
+    if IS_DRY_RUN:
+        print(f"\n[FASE 4] [DRY-RUN] Simulando escrita de {len(rows)} linha(s) no Sheets — não persistido.")
+        return f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit (DRY-RUN)"
+
     sa_path = settings.google_service_account_path
     if not sa_path or not Path(sa_path).exists():
         print("\n[FASE 4] ⚠ Google Service Account não configurado, pulando escrita.")
@@ -1103,8 +1378,8 @@ def write_to_sheets(rows: list[list[str]]) -> str | None:
 
     if current_header != HEADER_ROW:
         ws.update(range_name="A1", values=[HEADER_ROW])
-        last_col = chr(ord("A") + len(HEADER_ROW) - 1)
-        ws.format(f"A1:{last_col}1", {"textFormat": {"bold": True}})
+        last_cell = rowcol_to_a1(1, len(HEADER_ROW))
+        ws.format(f"A1:{last_cell}", {"textFormat": {"bold": True}})
         print(f"  ✓ Header {'corrigido' if current_header else 'criado'} na linha 1")
 
     ws.append_rows(rows, value_input_option="RAW")
@@ -1180,6 +1455,51 @@ def _fix_ortografia(text: str) -> str:
 
             result = re.sub(re.escape(wrong), correct, result, flags=re.IGNORECASE)
     return result
+
+
+def _norm_for_compare(text: str) -> str:
+    """Normalize a string for duplicate detection (lower + collapse whitespace).
+
+    Used to decide if two header fields (vara × órgão) are effectively the
+    same human-readable string and one of them should be suppressed to avoid
+    repetition in the response letter header.
+    """
+    import re
+
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+def _dedupe_orgao(vara: str, orgao: str) -> tuple[str, str]:
+    """Suppress duplicate header info between Vara/Seccional and Órgão.
+
+    Many ofícios arrive from the dataset with both ``court_tribunal_name``
+    (vara_tribunal) and ``organ_name`` (orgao_nome) carrying the same long
+    description, e.g. "Poder Judiciário Tribunal de Justiça do Estado do RS
+    2ª Vara Cível da Comarca de Bento Gonçalves". The Google Docs template
+    renders the two placeholders on consecutive lines, which causes a
+    visible repetition that the analyst keeps having to clean up by hand.
+
+    Rule: when the two strings are equivalent (after lower-casing and
+    collapsing whitespace) OR when one fully contains the other, keep the
+    longest version on ``vara`` and clear ``orgao``. Otherwise return both
+    unchanged so legitimate ``Vara ≠ Órgão`` cases keep working.
+    """
+    norm_vara = _norm_for_compare(vara)
+    norm_orgao = _norm_for_compare(orgao)
+
+    if not norm_vara or not norm_orgao:
+        return vara, orgao
+
+    if norm_vara == norm_orgao:
+        return vara, ""
+
+    if norm_orgao in norm_vara:
+        return vara, ""
+
+    if norm_vara in norm_orgao:
+        return orgao, ""
+
+    return vara, orgao
 
 
 def _clean_macro_text(raw: str) -> str:
@@ -1262,14 +1582,19 @@ def build_generate_doc_replacements(
         doc_field = first["cpf_fmt"]
         combined_macro = first["macro"]
     elif same_macro:
+        # Mesmo macro_id NÃO significa mesmo texto — saldos, datas e valores
+        # variam por investigado. Por isso replicamos o bloco "Em relação a
+        # ..." para cada investigado adicional, usando o texto próprio dele
+        # (``d["macro"]``), em vez de descartar.
         combined_name = first["nome"]
         doc_type_label = first["doc_type"]
-        extra_lines = [f"{d['nome']} - {d['doc_type']} n.º {d['cpf_fmt']}" for d in inv_data[1:]]
-        doc_field = first["cpf_fmt"] + "\n\n" + "\n\n".join(extra_lines)
-        shared = first["macro"]
-        shared = shared.replace("em seu nome", "em nome dos investigados")
-        shared = shared.replace("seu nome", "nome dos investigados")
-        combined_macro = shared
+        doc_field = first["cpf_fmt"]
+        extra_parts = [
+            f"Em relação a {d['nome']} - {d['doc_type']} n.º {d['cpf_fmt']}, "
+            f"informamos que {d['macro']}"
+            for d in inv_data[1:]
+        ]
+        combined_macro = first["macro"] + "\n\n" + "\n\n".join(extra_parts)
     else:
         clientes = [d for d in inv_data if not d["is_nao_cliente"]]
         nao_clientes = [d for d in inv_data if d["is_nao_cliente"]]
@@ -1306,6 +1631,7 @@ def build_generate_doc_replacements(
 
     vara = _fix_ortografia(_sanitize(ref_case.get("vara_tribunal")))
     orgao = _fix_ortografia(_sanitize(ref_case.get("orgao_nome")))
+    vara, orgao = _dedupe_orgao(vara, orgao)
 
     replacements = {
         "{{data da elaboração deste documento}}": _format_date_pt(),
@@ -1336,6 +1662,12 @@ def generate_doc(ref_case: dict, inv_results: list[dict]) -> str | None:
         print("    ⚠ APPS_SCRIPT_URL não configurada, pulando geração de doc.")
         return None
 
+    if IS_DRY_RUN:
+        fake_id = f"DRYRUN-{int(time.time()*1000)}"
+        fake_url = f"https://docs.google.com/document/d/{fake_id}/edit"
+        print(f"    [DRY-RUN] Simulando generate_doc → {fake_url}")
+        return fake_url
+
     replacements, bold_texts, doc_name = build_generate_doc_replacements(ref_case, inv_results)
 
     payload = {
@@ -1347,27 +1679,50 @@ def generate_doc(ref_case: dict, inv_results: list[dict]) -> str | None:
         "boldTexts": bold_texts,
     }
 
-    try:
-        resp = httpx.post(
-            settings.apps_script_url,
-            json=payload,
-            timeout=90,
-            follow_redirects=True,
-        )
-        resp.raise_for_status()
-        result = resp.json()
+    max_retries = 3
+    backoff = [5, 15, 30]
+    last_error: str | None = None
 
-        if "error" in result:
-            print(f"    ✗ Apps Script erro: {result['error']}")
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = httpx.post(
+                settings.apps_script_url,
+                json=payload,
+                timeout=90,
+                follow_redirects=True,
+            )
+            resp.raise_for_status()
+            result = resp.json()
+
+            if "error" in result:
+                last_error = str(result["error"])
+                if attempt < max_retries:
+                    wait = backoff[attempt - 1]
+                    print(
+                        f"    [DOC] Tentativa {attempt}/{max_retries} falhou ({last_error}), retentando em {wait}s..."
+                    )
+                    time.sleep(wait)
+                    continue
+                print(f"    ✗ Apps Script erro: {last_error}")
+                return None
+
+            doc_url = result.get("docUrl", "")
+            print(f"    ✓ Doc criado: {doc_url}")
+            return doc_url
+
+        except Exception as e:
+            last_error = str(e)
+            if attempt < max_retries:
+                wait = backoff[attempt - 1]
+                print(
+                    f"    [DOC] Tentativa {attempt}/{max_retries} falhou ({last_error}), retentando em {wait}s..."
+                )
+                time.sleep(wait)
+                continue
+            print(f"    ✗ Erro ao gerar doc após {max_retries} tentativas: {last_error}")
             return None
 
-        doc_url = result.get("docUrl", "")
-        print(f"    ✓ Doc criado: {doc_url}")
-        return doc_url
-
-    except Exception as e:
-        print(f"    ✗ Erro ao gerar doc: {e}")
-        return None
+    return None
 
 
 def group_cases_by_oficio(cases: list[dict]) -> list[dict]:
@@ -1397,12 +1752,9 @@ def group_cases_by_oficio(cases: list[dict]) -> list[dict]:
 # Slack Notifier
 # ---------------------------------------------------------------------------
 
-_ERROR_ACTION_MAP = {
-    "CERTS_NAO_CONFIGURADOS": "Executar `nucli` para renovar os certificados mTLS.",
-    "ERRO_LLM": "Verificar conectividade com LiteLLM e re-executar o processo.",
-    "ERRO_PARSE_JSON": "Resposta da LLM em formato inválido. Revisar prompt ou re-executar.",
-    "NAO_GERADO": "Falha na geração do documento. Verificar Apps Script e permissões do Drive.",
-}
+# Error → recommended action mapping is defined once in lexia.monitoring
+# (single source of truth for both the Slack notifier and the runbook).
+_ERROR_ACTION_MAP = {cat.value: action for cat, action in ERROR_ACTIONS.items()}
 
 
 class SlackNotifier:
@@ -1474,9 +1826,11 @@ class SlackNotifier:
         today = datetime.now().strftime("%d/%m/%Y")
 
         existing_ts = self._load_today_thread()
+        is_resumed = False
         if existing_ts:
             self._thread_ts = existing_ts
             self._parent_ts = existing_ts
+            is_resumed = True
             print(f"  [SLACK] Reutilizando thread do dia ({existing_ts})")
         else:
             parent_text = (
@@ -1489,6 +1843,11 @@ class SlackNotifier:
                 print(f"  [SLACK] Nova thread criada ({self._thread_ts})")
 
         if not self._thread_ts:
+            return
+
+        # Em retomadas (thread reutilizada), pular o post de "Execução iniciada"
+        # para não poluir a thread já em andamento.
+        if is_resumed:
             return
 
         type_lines = []
@@ -1554,13 +1913,13 @@ class SlackNotifier:
         self,
         processo: str,
         tipo: str,
-        error_key: str,
+        category: ErrorCategory,
         detail: str = "",
         lexia_id: str = "",
         investigados: list[str] | None = None,
     ):
         self._case_counter += 1
-        action = _ERROR_ACTION_MAP.get(error_key, "Investigar logs do pipeline.")
+        action = ERROR_ACTIONS.get(category, "Investigar logs do pipeline.")
         detail_line = f"\n>  *Detalhe:* {detail}" if detail else ""
 
         tipo_emoji = {
@@ -1571,14 +1930,15 @@ class SlackNotifier:
 
         inv_line = ""
         if investigados:
-            inv_line = f"\n>  *Investigados:* {', '.join(investigados)}"
+            inv_clean = [str(n) if n is not None else "(sem nome)" for n in investigados]
+            inv_line = f"\n>  *Investigados:* {', '.join(inv_clean)}"
 
         msg = (
             f":x:  *Caso {self._case_counter}/{self._total} — FALHA*  `{lexia_id}`\n"
             f"\n"
             f">  *Processo:* `{processo}`\n"
             f">  {tipo_emoji}  *Tipo:* {tipo}{inv_line}\n"
-            f">  *Erro:* {error_key}{detail_line}\n"
+            f">  *Categoria:* `{category.value}`{detail_line}\n"
             f"\n"
             f":warning:  *Ação necessária:* {action}"
         )
@@ -1594,36 +1954,76 @@ class SlackNotifier:
         self.notify_case_error(
             processo,
             tipo,
-            "CERTS_NAO_CONFIGURADOS",
+            ErrorCategory.CERTS_MISSING,
             "Certificados mTLS não encontrados no ambiente.",
             lexia_id,
             investigados=investigados,
         )
 
-    def finish(
-        self,
-        succeeded: int,
-        errors: int,
-        certs_missing: int,
-        duration_secs: float,
-    ):
+    def finish(self, summary: RunSummary, slo: SLOReport):
+        """Post the run wrap-up with totals, error breakdown and SLO status."""
         if not self._enabled:
             return
 
+        duration_secs = summary.total_duration_secs
         mins = int(duration_secs // 60)
         secs = int(duration_secs % 60)
         duration_str = f"{mins}m {secs:02d}s" if mins else f"{secs}s"
 
-        has_issues = errors or certs_missing
-        status_emoji = ":warning:" if has_issues else ":white_check_mark:"
-        status_text = "Concluída com pendências" if has_issues else "Concluída com sucesso"
+        if summary.total > 0:
+            avg_str = f"{summary.avg_duration_secs:.1f}s por ofício"
+        else:
+            avg_str = "—"
 
-        result_lines = [f"  :white_check_mark:  Sucesso — *{succeeded}*"]
-        if errors:
-            result_lines.append(f"  :x:  Erros — *{errors}*")
-        if certs_missing:
-            result_lines.append(f"  :no_entry_sign:  Certs ausentes — *{certs_missing}*")
+        has_issues = summary.errors or summary.certs_missing or not slo.healthy
+        if not slo.healthy:
+            status_emoji = ":rotating_light:"
+            status_text = "Concluída com SLO estourado"
+        elif has_issues:
+            status_emoji = ":warning:"
+            status_text = "Concluída com pendências"
+        else:
+            status_emoji = ":white_check_mark:"
+            status_text = "Concluída com sucesso"
+
+        result_lines = [f"  :white_check_mark:  Sucesso — *{summary.succeeded}*"]
+        if summary.errors:
+            result_lines.append(f"  :x:  Erros — *{summary.errors}*")
+        if summary.certs_missing:
+            result_lines.append(f"  :no_entry_sign:  Certs ausentes — *{summary.certs_missing}*")
         result_block = "\n".join(result_lines)
+
+        # Erros por categoria (só aparece se houver erros)
+        errors_by_cat = summary.errors_by_category
+        cat_block = ""
+        if errors_by_cat:
+            cat_lines = [f"  •  `{cat}` — *{count}*" for cat, count in sorted(errors_by_cat.items())]
+            cat_block = "\n*Erros por categoria:*\n" + "\n".join(cat_lines) + "\n"
+
+        # Bloco SLO — por padrão FORA da postagem do Slack (decisão de produto:
+        # thread limpa para o time de Ops). Os SLOs continuam sendo calculados
+        # e persistidos em logs/run-summary-{YYYY-MM-DD}.json para o on-call.
+        # Para reativar a postagem (ex.: durante investigação), basta setar:
+        #     LEXIA_SHOW_SLO_BLOCK=1
+        # Compat: LEXIA_SUPPRESS_SLO_BLOCK=1 (legado) continua funcionando como
+        # no-op explícito, sem efeito sobre o novo default.
+        show_slo = os.environ.get("LEXIA_SHOW_SLO_BLOCK", "").lower() in ("1", "true", "yes")
+        if show_slo:
+            p95 = summary.percentile_duration_secs(95)
+            slo_lines = [
+                f"  •  p95 de duração: *{p95:.1f}s* (alvo ≤ {slo.targets.p95_seconds:.0f}s)",
+                f"  •  Taxa de erro: *{summary.error_rate:.1%}* (alvo ≤ {slo.targets.error_rate:.0%})",
+                f"  •  Uso de fallback IA: *{summary.fallback_rate:.1%}* (alvo ≤ {slo.targets.fallback_rate:.0%})",
+            ]
+            slo_block = "\n*SLOs (JUD-1995):*\n" + "\n".join(slo_lines)
+
+            violations_block = ""
+            if not slo.healthy:
+                v_lines = [f"  :rotating_light:  {v.message}" for v in slo.violations]
+                violations_block = "\n\n*SLO estourado — investigar:*\n" + "\n".join(v_lines)
+        else:
+            slo_block = ""
+            violations_block = ""
 
         msg = (
             f"{self._DIVIDER}\n"
@@ -1632,8 +2032,12 @@ class SlackNotifier:
             f"\n"
             f"*Resultado:*\n"
             f"{result_block}\n"
+            f"{cat_block}"
             f"\n"
-            f":stopwatch:  *Duração:* {duration_str}"
+            f":stopwatch:  *Tempo total:* {duration_str}\n"
+            f":hourglass_flowing_sand:  *Tempo médio:* {avg_str}\n"
+            f"{slo_block}"
+            f"{violations_block}"
         )
         self._post(msg)
 
@@ -1647,6 +2051,10 @@ def main():
     import time as _time
 
     t_start = _time.monotonic()
+    run_summary = RunSummary(
+        decision_mode=settings.decision_mode,
+        days_back=int(os.environ.get("DAYS_BACK", os.environ.get("LEXIA_DAYS_BACK", "0")) or 0),
+    )
 
     limit = int(os.environ.get("LEXIA_LIMIT", "0")) or None
     processes = TARGET_PROCESSES or None
@@ -1675,7 +2083,11 @@ def main():
 
     # Deduplication — skip already-processed ofícios
     print("\n[DEDUP] Verificando ofícios já processados...")
-    already_done = fetch_processed_oficios()
+    if IS_DRY_RUN:
+        print("  [DRY-RUN] Pulando dedup — todos os casos do range serão simulados.")
+        already_done = set()
+    else:
+        already_done = fetch_processed_oficios()
     skipped_count = 0
     if already_done:
         before = len(cases)
@@ -1686,6 +2098,7 @@ def main():
         if not cases:
             print("\n✓ Todos os ofícios já foram processados anteriormente.")
             sys.exit(0)
+    run_summary.skipped_already_processed = skipped_count
 
     # Group rows by id_oficio (1 ofício = 1 carta-resposta)
     grouped_cases = group_cases_by_oficio(cases)
@@ -1727,6 +2140,11 @@ def main():
         tipo = TIPO_MAP.get(ref.get("tipo_oficio", ""), ref.get("tipo_oficio", ""))
         lexia_id = generate_lexia_id()
 
+        # Per-ofício timing (JUD-1995): start_at + duration go to the spreadsheet
+        # so we can compute p95 across runs and feed the SLO checker.
+        case_started_at = datetime.now(UTC).isoformat()
+        t_case_start = _time.monotonic()
+
         print(f"\n{'—' * 70}")
         print(f"[{i}/{len(grouped_cases)}] {lexia_id} | Ofício: {id_oficio[:12]}...")
         print(f"  Processo: {processo} ({tipo})")
@@ -1753,12 +2171,23 @@ def main():
             print(f"      Mario-Box:     {enrichment['mario_box_caixinhas'][:80]}")
             print(f"      Dados Banc.:   {enrichment['dados_bancarios'][:80]}")
 
-            # Phase 3 — LLM decision
-            print("    [FASE 3] LLM — decisão da IA...")
-            llm_trace = get_llm_decision(inv, enrichment)
+            # Phase 3 — Decision (LLM, deterministic, shadow or hybrid)
+            print(f"    [FASE 3] Decisão (modo={settings.decision_mode})...")
+            llm_trace = get_decision(inv, enrichment)
             print(f"      Macro:         {llm_trace['llm_macro_aplicada']}")
             print(f"      ID Macro:      {llm_trace['llm_id_macro']}")
+            print(
+                f"      Source:        {llm_trace.get('decision_source', '?')} "
+                f"(confidence={llm_trace.get('confidence', 'N/A')})"
+            )
             print(f"      Observações:   {llm_trace['llm_observacoes'][:100]}")
+            det_trace = llm_trace.get("det_trace") or {}
+            if det_trace and det_trace.get("decision_source") not in ("skipped", None):
+                print(
+                    f"      [DET] macro={det_trace.get('llm_id_macro')} "
+                    f"conf={det_trace.get('confidence')} "
+                    f"reason={det_trace.get('decision_reason', '')[:80]}"
+                )
 
             if enrichment["waze_shard"] == "CERTS_NAO_CONFIGURADOS":
                 overall_status = "certs_missing"
@@ -1780,49 +2209,91 @@ def main():
         if not doc_url and overall_status == "success":
             overall_status = "error"
 
-        # Slack per-ofício notification
-        inv_names = [inv.get("nome_investigado", "N/A") for inv in investigados]
-        if overall_status == "success":
-            slack.notify_case_success(
-                processo,
-                tipo,
-                inv_results,
-                doc_url,
-                lexia_id,
-            )
-        elif overall_status == "certs_missing":
-            slack.notify_case_certs_missing(processo, tipo, lexia_id, investigados=inv_names)
-        else:
-            error_key = "ERRO_LLM"
-            any_parse = any(
-                r["llm_trace"]["llm_macro_aplicada"].startswith("ERRO_PARSE") for r in inv_results
-            )
-            if any_parse:
-                error_key = "ERRO_PARSE_JSON"
-            elif not doc_url:
-                error_key = "NAO_GERADO"
-            first_obs = inv_results[0]["llm_trace"].get("llm_observacoes", "")[:200]
-            slack.notify_case_error(
-                processo,
-                tipo,
-                error_key,
-                first_obs,
-                lexia_id,
-                investigados=inv_names,
-            )
+        # Categorize the failure (JUD-1995). Done once per ofício so that the
+        # spreadsheet, the Slack notification and the run-summary all use the
+        # same canonical category.
+        case_enrichments = [r["enrichment"] for r in inv_results]
+        error_category = categorize_case_error(
+            enrichments=case_enrichments,
+            inv_results=inv_results,
+            doc_url=doc_url,
+            overall_status=overall_status,
+        )
+
+        case_duration = _time.monotonic() - t_case_start
+
+        # Slack per-ofício notification (blindado: falha de Slack NUNCA derruba pipeline)
+        inv_names = [
+            (inv.get("nome_investigado") or "(sem nome)") for inv in investigados
+        ]
+        try:
+            if overall_status == "success":
+                slack.notify_case_success(
+                    processo,
+                    tipo,
+                    inv_results,
+                    doc_url,
+                    lexia_id,
+                )
+            elif overall_status == "certs_missing":
+                slack.notify_case_certs_missing(processo, tipo, lexia_id, investigados=inv_names)
+            else:
+                first_obs = inv_results[0]["llm_trace"].get("llm_observacoes", "")[:200]
+                slack.notify_case_error(
+                    processo,
+                    tipo,
+                    error_category,
+                    first_obs,
+                    lexia_id,
+                    investigados=inv_names,
+                )
+        except Exception as _slack_err:
+            print(f"  [SLACK WARN] Notificação falhou (pipeline continua): {_slack_err}")
 
         # Build single Sheet row for this ofício (concatenated fields)
         info_sol = ref.get("info_solicitada", "")
         if isinstance(info_sol, list):
             info_sol = ", ".join(str(x) for x in info_sol)
 
-        all_names = " | ".join(r["case"].get("nome_investigado", "") for r in inv_results)
-        all_cpfs = " | ".join(r["case"].get("cpf_cnpj", "") for r in inv_results)
-        all_macros = " | ".join(r["llm_trace"]["llm_macro_aplicada"] for r in inv_results)
-        all_macro_ids = " | ".join(r["llm_trace"]["llm_id_macro"] for r in inv_results)
-        all_macro_texts = " | ".join(r["llm_trace"]["llm_texto_resposta"] for r in inv_results)
-        all_obs = " | ".join(r["llm_trace"]["llm_observacoes"] for r in inv_results)
-        all_raw = " | ".join(r["llm_trace"]["llm_raw_response"] for r in inv_results)
+        def _s(v: object) -> str:
+            return "" if v is None else str(v)
+
+        all_names = " | ".join(_s(r["case"].get("nome_investigado")) or "(sem nome)" for r in inv_results)
+        all_cpfs = " | ".join(_s(r["case"].get("cpf_cnpj")) for r in inv_results)
+        all_macros = " | ".join(_s(r["llm_trace"].get("llm_macro_aplicada")) for r in inv_results)
+        all_macro_ids = " | ".join(_s(r["llm_trace"].get("llm_id_macro")) for r in inv_results)
+        all_macro_texts = " | ".join(_s(r["llm_trace"].get("llm_texto_resposta")) for r in inv_results)
+        all_obs = " | ".join(_s(r["llm_trace"].get("llm_observacoes")) for r in inv_results)
+        all_raw = " | ".join(_s(r["llm_trace"].get("llm_raw_response")) for r in inv_results)
+
+        # Deterministic engine bookkeeping (per ofício, joined across investigados)
+        det_traces = [r["llm_trace"].get("det_trace") or {} for r in inv_results]
+        det_id_macro = " | ".join(_s(t.get("llm_id_macro")) for t in det_traces)
+        det_macro_aplicada = " | ".join(_s(t.get("llm_macro_aplicada")) for t in det_traces)
+        det_texto = " | ".join(_s(t.get("llm_texto_resposta")) for t in det_traces)[:2000]
+        det_source = " | ".join(_s(t.get("decision_source")) or "skipped" for t in det_traces)
+        det_confidence = " | ".join(_s(t.get("confidence")) or "N/A" for t in det_traces)
+        det_reason = " | ".join(_s(t.get("decision_reason"))[:200] for t in det_traces)
+
+        # Comparisons LLM vs deterministic (only meaningful in shadow mode)
+        match_flags: list[str] = []
+        sim_scores: list[str] = []
+        for r in inv_results:
+            llm_t = r["llm_trace"]
+            det_t = llm_t.get("det_trace") or {}
+            if det_t.get("decision_source") in ("skipped", None, ""):
+                match_flags.append("N/A")
+                sim_scores.append("N/A")
+                continue
+            same_macro = (det_t.get("llm_id_macro") or "") == (llm_t.get("llm_id_macro") or "")
+            match_flags.append("TRUE" if same_macro else "FALSE")
+            sim = _text_similarity(
+                det_t.get("llm_texto_resposta", ""),
+                llm_t.get("llm_texto_resposta", ""),
+            )
+            sim_scores.append(f"{sim:.3f}")
+        det_match_macro = " | ".join(match_flags)
+        det_match_text_similarity = " | ".join(sim_scores)
 
         first_enr = inv_results[0]["enrichment"]
         all_vals = " | ".join(str(r["case"].get("valor_solicitado", "")) for r in inv_results)
@@ -1860,8 +2331,39 @@ def main():
             doc_url or "NAO_GERADO",
             overall_status,
             datetime.now(UTC).isoformat(),
+            case_started_at,
+            f"{case_duration:.2f}",
+            error_category.value,
+            det_id_macro,
+            det_macro_aplicada,
+            det_texto,
+            det_source,
+            det_match_macro,
+            det_match_text_similarity,
+            det_confidence,
+            det_reason,
         ]
         all_rows.append(row)
+
+        # Feed the run summary (JUD-1995) — one record per ofício.
+        first_source = ""
+        for r in inv_results:
+            src = (r.get("llm_trace") or {}).get("decision_source") or ""
+            if src:
+                first_source = src
+                break
+        run_summary.add(
+            CaseRecord(
+                lexia_id=lexia_id,
+                id_oficio=str(id_oficio),
+                numero_processo=str(ref.get("numero_processo", "")),
+                tipo_oficio=tipo,
+                status=overall_status,
+                error_category=error_category,
+                duration_secs=round(case_duration, 2),
+                decision_source=first_source,
+            )
+        )
 
     # Phase 4
     try:
@@ -1869,16 +2371,48 @@ def main():
     except Exception as e:
         print(f"\n[FASE 4] ⚠ Erro ao gravar no Sheets (não impede finalização): {e}")
 
+    # Finalize the run summary and check SLOs (JUD-1995).
+    run_summary.mark_finished()
+    slo_report = compute_slo_report(run_summary)
+
     print(f"\n{'=' * 70}")
-    print(f"✓ Pipeline concluído — {len(all_rows)} ofício(s) processados")
-    succeeded = sum(1 for r in all_rows if r[-2] == "success")
-    certs_missing = sum(1 for r in all_rows if r[-2] == "certs_missing")
-    errors = sum(1 for r in all_rows if r[-2] == "error")
-    print(f"  Success: {succeeded} | Certs missing: {certs_missing} | Errors: {errors}")
+    print(f"✓ Pipeline concluído — {run_summary.total} ofício(s) processados")
+    print(
+        f"  Success: {run_summary.succeeded} | "
+        f"Certs missing: {run_summary.certs_missing} | "
+        f"Errors: {run_summary.errors}"
+    )
+    if run_summary.errors_by_category:
+        print("  Erros por categoria:")
+        for cat, count in sorted(run_summary.errors_by_category.items()):
+            print(f"    • {cat}: {count}")
+    print(
+        f"  Duração — total: {run_summary.total_duration_secs:.1f}s | "
+        f"avg: {run_summary.avg_duration_secs:.1f}s | "
+        f"p95: {run_summary.percentile_duration_secs(95):.1f}s"
+    )
+    print(
+        f"  SLOs (alvos: p95≤{slo_report.targets.p95_seconds:.0f}s, "
+        f"erro≤{slo_report.targets.error_rate:.0%}, "
+        f"fallback≤{slo_report.targets.fallback_rate:.0%}) → "
+        f"{'OK' if slo_report.healthy else 'ESTOURADO'}"
+    )
+    if not slo_report.healthy:
+        for v in slo_report.violations:
+            print(f"    ! {v.message}")
     print("=" * 70)
 
-    duration = _time.monotonic() - t_start
-    slack.finish(succeeded, errors, certs_missing, duration)
+    # Persist run-summary JSON for the on-call to inspect (JUD-1995 AC).
+    try:
+        logs_dir = Path(__file__).resolve().parent.parent / "logs"
+        out_path = write_run_summary_json(run_summary, slo_report, logs_dir)
+        print(f"  Run summary salvo em: {out_path}")
+    except Exception as e:
+        print(f"  [WARN] Falha ao salvar run-summary JSON: {e}")
+
+    # Total wall-clock duration (kept for consistency with previous behavior).
+    _ = _time.monotonic() - t_start
+    slack.finish(run_summary, slo_report)
 
 
 if __name__ == "__main__":

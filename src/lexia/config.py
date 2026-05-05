@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -51,6 +52,17 @@ class Settings(BaseSettings):
         default="",
         alias="LEXIA_TARGET_PROCESSES",
         description="Comma-separated process numbers",
+    )
+
+    # Decision engine routing
+    #   "llm"           — current behaviour (LLM only).
+    #   "shadow"        — run both, persist det_* columns, but USE the LLM result.
+    #   "hybrid"        — use deterministic when confidence=HIGH, LLM as fallback.
+    #   "deterministic" — deterministic only; LOW confidence yields ERRO_*.
+    decision_mode: Literal["llm", "shadow", "hybrid", "deterministic"] = Field(
+        default="llm",
+        alias="LEXIA_DECISION_MODE",
+        description="How to choose between deterministic engine and LLM.",
     )
 
 

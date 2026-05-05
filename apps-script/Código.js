@@ -43,7 +43,12 @@ function _handleGenerate(data) {
   var parentFolder = DriveApp.getFolderById(folderId);
   var folder = parentFolder;
   if (data.subfolderName) {
-    folder = parentFolder.createFolder(data.subfolderName);
+    var existing = parentFolder.getFoldersByName(data.subfolderName);
+    if (existing.hasNext()) {
+      folder = parentFolder.createFolder("CR-" + data.subfolderName);
+    } else {
+      folder = parentFolder.createFolder(data.subfolderName);
+    }
   }
 
   var copy = DriveApp.getFileById(templateId).makeCopy(docName, folder);
